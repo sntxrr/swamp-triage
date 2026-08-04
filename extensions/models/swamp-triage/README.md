@@ -93,7 +93,55 @@ When no success appears anywhere in the retained history, the result carries
 `successOutsideRetention: true` rather than reporting the oldest retained
 failure as the start. A fabricated start time is worse than an admitted unknown.
 
-## Wrapping it in a workflow
+## Bundled workflows
+
+Two ship with the extension. They are identical except for the notifier, and
+both go from a target name to a notification with nothing else to write:
+
+```bash
+swamp workflow run @sntxrr/investigate-apprise --input target=<name>
+swamp workflow run @sntxrr/investigate-ntfy    --input target=<name>
+```
+
+| Workflow | Needs | Instance name |
+| --- | --- | --- |
+| `@sntxrr/investigate-apprise` | [`@sntxrr/apprise-notify`](https://swamp-club.com) | `apprise` |
+| `@sntxrr/investigate-ntfy` | [`@mgreten/ntfy-notify`](https://swamp-club.com) | `ntfy` |
+
+**Which one:** prefer Apprise if you already run it — a single endpoint fans out
+to ntfy *plus* Matrix, Discord, email and 100+ others, so it picks a gateway
+rather than a destination. Use the ntfy workflow when you want to post straight
+to ntfy and run no Apprise server.
+
+**Why two workflows and not one with a switch:** a workflow step's
+`modelIdOrName` and `methodName` are plain strings, not expressions — only
+`inputs` and `guard` accept `${{ }}`. The two notifiers differ in both (`notify`
+with a `body` argument vs `send` with a `message` argument), so no single step
+can serve both. Adding a third transport is another workflow file, not a code
+change.
+
+Both are read-only, and both are deliberately **untriggered** — this is what you
+reach for once something has already failed.
+
+### The quiet-when-healthy gate
+
+Notification is gated on the *finding*, not on run status, so investigating a
+healthy target completes successfully and sends nothing:
+
+```yaml
+guard: >-
+  ${{ !inputs.notify ||
+  !data.latest('triage', inputs.target).attributes.failing }}
+```
+
+A `guard` is a CEL predicate evaluated before the step, where **truthy means
+skip**. It is the only workflow-level way to branch on step *output* —
+`dependsOn` conditions are status-based (`succeeded`/`failed`/…) and cannot
+express a predicate. The gate lives here rather than in a notifier's own
+arguments so it stays identical across transports; `ntfy-notify` has no gating
+argument at all, and `send` always sends.
+
+## Wrapping it in your own workflow
 
 The model is the generic half. A workflow around it turns an alert into a
 notification without anyone opening a terminal — the target comes in as a
@@ -137,28 +185,75 @@ jobs:
         condition: { type: succeeded }
 ```
 
-This is documented rather than bundled on purpose: the notify step names a
-model instance (`apprise`) that is specific to one operator's setup. Shipping
-it would hard-code a notifier nobody else has. The investigating half is the
-reusable part; wire the alerting half to whatever you already run.
+Swap `notifier` for whatever you already run. The investigating half is the
+reusable part; the alerting half is yours.
 
-Note the `when` gate lives in the notifier's own arguments rather than in a step
-condition — swamp step conditions are status-based and cannot express a
-predicate over step output.
+### Adding durability with an outbox
+
+The bundled workflows notify directly: if the transport is down, the finding is
+still recorded but the notification is simply lost (the step is
+`allowFailure: true`, so a dead notifier never masks a good finding). If you
+want delivery to survive that, put
+[`@mgreten/notification-outbox`](https://swamp-club.com) in front of it — a
+durable, deduplicating ledger.
+
+Be clear about what it is, though: it **performs no transport I/O**.
+`enqueueNotification` writes a record; `drainNotifications` takes *"the
+transport results the caller obtained"*. It sits in front of a notifier, it does
+not replace one — so you still need an apprise or ntfy step, and the shape
+becomes:
+
+```
+investigate → enqueueNotification → <your notifier> → drainNotifications
+```
+
+What you gain is dedup (an alert storm collapses to one record per
+`workItem`+`event`+`era`) and durable retry state. What it costs is two extra
+steps and some mapping work: `workItem` must match `^[a-zA-Z0-9][a-zA-Z0-9_-]*$`,
+so a target named with a `/` or `.` needs sanitising first; `event` is an enum of
+`approval-needed | failed | completed`, so a triage category maps onto `failed`
+or `completed` rather than travelling as itself; and `era` wants a stable
+per-run token you supply as a workflow input.
+
+Worth it for a noisy fleet where the same failure would otherwise page you
+hourly. Overkill for a handful of watchers, which is why it is not bundled.
 
 ## What a finding contains
 
-The finding republishes the **verbatim error string** the target's own summary
-report recorded. That is the point — a paraphrased error is not diagnosable —
-but it is worth knowing before wiring the `summary` into a chat channel.
+The finding republishes the error string the target's own summary report
+recorded. That is the point — a paraphrased error is not diagnosable — but the
+text is about to travel further than it was written to go, into a chat channel
+or a phone.
 
 Swamp already redacts model global arguments in those reports (a vaulted
 password shows as `***`). What it cannot redact is a secret an upstream model
-wrote into the *text* of its own error message. If one of your models does that,
-this will carry it into whatever the notification step sends. That is a property
-of the upstream error, not something this model can detect — suppressing the
-recorded error would defeat the tool. Worth a look at your own models' error
-paths before pointing a public channel at it.
+wrote into the *body* of its own error message. So this model redacts too,
+before the finding is written:
+
+| Rule | Catches |
+| --- | --- |
+| `private-key` | Whole `-----BEGIN … PRIVATE KEY-----` blocks |
+| `jwt` | `eyJ…` three-part tokens |
+| `url-credentials` | `https://user:pass@host` |
+| `authorization-header` | `Authorization: Bearer …` |
+| `provider-token` | `AKIA…`, `ghp_…`, `github_pat_…`, `xox[baprs]-…`, `sk-…` |
+| `keyed-value` | `password=…`, `"api_key": "…"`, `token: …` and kin |
+
+Each rule keeps the key or scheme and blanks only the value, so `token=abc123`
+becomes `token=[redacted]` — still obviously a token problem, no longer a leaked
+token. The finding reports `redactions` (a count) and `redactedKinds`, so a
+reader can tell what was removed rather than wondering.
+
+Redaction is deliberately **structural, not lexical**: it redacts
+`password=<value>`, never the word "password". The controller error that
+motivated this model reads `Invalid username or password` and carries no value
+at all — blanking that phrase would destroy the single most diagnostic sentence
+in the finding while protecting nothing. Classification also runs on the
+original text *before* redaction, so redaction can never eat the evidence a
+classifier rule matches on and silently downgrade a known failure to `unknown`.
+
+It is a net, not a guarantee — a secret in a shape no rule recognises still
+travels. It narrows the exposure rather than closing it.
 
 Nothing else in a finding is sensitive: `definitionPath` is stored
 repo-relative, so a finding never carries the investigating host's directory

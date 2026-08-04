@@ -1,0 +1,144 @@
+id: 1d18f54e-b7f1-433d-a5e1-0d37c79de3fd
+name: @sntxrr/investigate-apprise
+description: >-
+  Investigate why any model or workflow in this repo is failing, and raise the
+  finding through Apprise. Domain-agnostic: the target is named at run time, so
+  this is the same workflow whether the thing that broke talks to a network
+  controller, a DNS server, or an object store.
+
+    swamp workflow run @sntxrr/investigate-apprise --input target=<name>
+
+  Requires @sntxrr/apprise-notify and a model instance of it named `apprise`:
+
+    swamp extension pull @sntxrr/apprise-notify
+    swamp model create @sntxrr/apprise-notify apprise \
+      --global-arg 'apiUrl=http://apprise.internal:8000' \
+      --global-arg 'configKey=<your-config-key>'
+
+  Apprise is the fan-out choice: one endpoint reaches Matrix, Discord, ntfy,
+  email and 100+ others, so picking it here does not pick a destination. If you
+  would rather post to ntfy directly and run no Apprise server, use the sibling
+  `@sntxrr/investigate-ntfy` workflow instead -- the notifiers take different method
+  names and argument shapes, which is why these are two workflows rather than
+  one with a switch.
+
+  Read-only end to end. `investigate` reads summary reports previous runs left
+  behind and never invokes the target, which is what makes it safe to point at
+  anything, including write-capable models.
+
+  Deliberately has NO trigger. This is what you reach for once something else
+  has already failed; scheduling it would investigate targets nobody asked
+  about. Notification is gated on the finding, not on run status, so a target
+  that turns out to be healthy completes successfully and stays silent.
+tags: {}
+inputs:
+  properties:
+    target:
+      type: string
+      description: >-
+        Name of the model or workflow to investigate, exactly as it appears in
+        `swamp model list` / `swamp workflow list`. No default -- investigating
+        a target nobody named is never what was wanted.
+    kind:
+      type: string
+      description: >-
+        Which definitions to search. `auto` searches models, then workflows.
+        Set explicitly only when a model and a workflow share a name.
+      enum:
+        - auto
+        - model
+        - workflow
+      default: auto
+    maxVersions:
+      type: integer
+      description: >-
+        How far back through recorded runs to walk when looking for the last
+        success. The default spans roughly a day of hourly checks; raise it for
+        a target that runs less often, or the boundary falls outside the window
+        and is reported as unknown rather than guessed.
+      default: 60
+    notify:
+      type: boolean
+      description: >-
+        When false, investigate and record the finding but stay silent. For
+        working an incident by hand without paging anyone.
+      default: true
+  required:
+    - target
+jobs:
+  - name: investigate
+    description: Read the target's recorded history and classify the failure
+    steps:
+      - name: collect
+        description: >-
+          Resolve the target by name, walk its summary-report versions back to
+          the last success, and classify the recorded error.
+
+          When the target is a workflow, this also follows the failing step
+          into the model that step invoked -- a workflow summary names the step
+          but not its error, so stopping at the workflow level would report
+          `detect-drift failed` and omit the actual cause.
+
+          Identifiable secret values are redacted from the error here, before
+          the finding is written, so the notification below cannot carry a
+          token an upstream model put in its own error text.
+        task:
+          type: model_method
+          modelIdOrName: triage
+          methodName: investigate
+          inputs:
+            target: ${{ inputs.target }}
+            kind: ${{ inputs.kind }}
+            maxVersions: ${{ inputs.maxVersions }}
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: report
+    description: Notify through Apprise when the target is actually failing
+    steps:
+      - name: notify-finding
+        description: >-
+          Gated by a step `guard` rather than by the notifier's own arguments.
+          A guard is a CEL predicate over step output, which `dependsOn`
+          conditions cannot express -- those are status-based only. Truthy
+          guard means SKIP, so this reads as "skip when notification is turned
+          off, or when the target turned out to be healthy".
+
+          Deliberately not the notifier's `when` argument, even though Apprise
+          offers one: the guard keeps the gate identical in this workflow and
+          in `investigate-ntfy`, whose notifier has no such argument. The gate
+          belongs to the decision, not to the transport.
+
+          The data name is the target's own name, so the reference is built
+          from the same input that selected the target -- there is no separate
+          place for the two to drift apart.
+        guard: >-
+          ${{ !inputs.notify ||
+          !data.latest('triage', inputs.target).attributes.failing }}
+        task:
+          type: model_method
+          modelIdOrName: apprise
+          methodName: notify
+          inputs:
+            title: >-
+              ${{ "Investigation: " + inputs.target + " (" +
+              data.latest('triage', inputs.target).attributes.category + ")" }}
+            body: ${{ data.latest('triage', inputs.target).attributes.summary }}
+            type: warning
+            format: markdown
+        dependsOn: []
+        weight: 0
+        # Non-fatal: a dead notifier should not mask a finding that was
+        # successfully recorded and is readable with `swamp data get triage
+        # <target>`. Note the trade-off -- allowFailure here also means a
+        # malformed CEL expression in this step passes as a green run, so
+        # validate after editing rather than trusting run status.
+        allowFailure: true
+    dependsOn:
+      - job: investigate
+        condition:
+          type: succeeded
+    weight: 1
+version: 1

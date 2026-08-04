@@ -2,6 +2,7 @@ import { assertEquals } from "jsr:@std/assert@1";
 import {
   classifyError,
   readTopLevelScalars,
+  redactSecrets,
   reconstructTimeline,
   resolveTargets,
   type RunPoint,
@@ -325,4 +326,99 @@ Deno.test("scalars: nested mapping values do not leak upward", () => {
   );
   assertEquals(d.name, "outer");
   assertEquals(d.host, undefined);
+});
+
+/* --------------------------- redaction ---------------------------- */
+
+Deno.test("redact: the motivating error survives completely intact", () => {
+  // The whole point of the tool. This error carries no secret VALUE -- only
+  // the words "username or password" -- and mangling it would destroy the
+  // most diagnostic sentence in the finding while protecting nothing.
+  const original =
+    'UniFi login to 192.0.2.1 failed (403): {"message":"Invalid username or ' +
+    'password","code":"AUTHENTICATION_FAILED_INVALID_CREDENTIALS"}';
+  const r = redactSecrets(original);
+  assertEquals(r.count, 0);
+  assertEquals(r.text, original);
+  // And it must still classify as auth afterwards.
+  assertEquals(classifyError(r.text).category, "auth");
+});
+
+Deno.test("redact: keyed values lose the value, keep the key", () => {
+  const r = redactSecrets("connect failed: password=hunter2 for user admin");
+  assertEquals(r.text, "connect failed: password=[redacted] for user admin");
+  assertEquals(r.kinds, ["keyed-value"]);
+  // The surrounding context survives, so the error is still readable.
+  assertEquals(r.text.includes("for user admin"), true);
+});
+
+Deno.test("redact: quoted JSON secrets are caught", () => {
+  const r = redactSecrets('{"api_key": "abcd1234efgh", "region": "us-west-2"}');
+  assertEquals(r.text.includes("abcd1234efgh"), false);
+  assertEquals(r.text.includes("us-west-2"), true);
+});
+
+Deno.test("redact: credentials embedded in a URL", () => {
+  const r = redactSecrets("failed to reach https://admin:s3cr3t@example.com/api");
+  assertEquals(r.text, "failed to reach https://admin:[redacted]@example.com/api");
+  assertEquals(r.kinds.includes("url-credentials"), true);
+});
+
+Deno.test("redact: a JWT is removed wholesale", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.abcdefghijk";
+  const r = redactSecrets(`401 rejected token ${jwt} at gateway`);
+  assertEquals(r.text.includes(jwt), false);
+  assertEquals(r.text.includes("at gateway"), true);
+  assertEquals(classifyError(r.text).category, "auth");
+});
+
+Deno.test("redact: provider-shaped tokens are recognised on sight", () => {
+  const r = redactSecrets(
+    "denied for AKIAIOSFODNN7EXAMPLE and ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345",
+  );
+  assertEquals(r.text.includes("AKIAIOSFODNN7EXAMPLE"), false);
+  assertEquals(r.text.includes("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345"), false);
+  assertEquals(r.count, 2);
+});
+
+Deno.test("redact: a private key block goes entirely", () => {
+  const r = redactSecrets(
+    "ssh failed:\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nexiting",
+  );
+  assertEquals(r.text.includes("b3BlbnNzaC1rZXk"), false);
+  assertEquals(r.text.includes("[redacted:private-key]"), true);
+  assertEquals(r.text.includes("exiting"), true);
+});
+
+Deno.test("redact: an authorization header value is blanked", () => {
+  const r = redactSecrets("sent Authorization: Bearer abc123def456 -> 403");
+  assertEquals(r.text.includes("abc123def456"), false);
+  assertEquals(r.text.includes("403"), true);
+});
+
+Deno.test("redact: clean text is returned untouched with no false positives", () => {
+  const clean = "connect ECONNREFUSED 192.0.2.1:443";
+  const r = redactSecrets(clean);
+  assertEquals(r.text, clean);
+  assertEquals(r.count, 0);
+  assertEquals(r.kinds, []);
+});
+
+Deno.test("redact: null and empty are safe", () => {
+  assertEquals(redactSecrets(null).text, "");
+  assertEquals(redactSecrets(null).count, 0);
+  assertEquals(redactSecrets("").count, 0);
+});
+
+Deno.test("redact: classification is never degraded by redaction", () => {
+  // Redaction runs after classification in the method for exactly this
+  // reason, but the rules should not eat classifier evidence even so.
+  const cases: [string, string][] = [
+    ["403 Forbidden: token=abc123", "auth"],
+    ["ECONNREFUSED with password=hunter2 in config", "unreachable"],
+    ["429 rate limit, api_key=deadbeefcafe", "rate_limit"],
+  ];
+  for (const [text, want] of cases) {
+    assertEquals(classifyError(redactSecrets(text).text).category, want, text);
+  }
 });

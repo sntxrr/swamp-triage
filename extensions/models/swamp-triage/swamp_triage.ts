@@ -182,6 +182,120 @@ const RULES: Rule[] = [
   },
 ];
 
+/* ------------------------------------------------------------------ *
+ * Secret redaction
+ *
+ * A finding republishes the target's error text, and that text is
+ * about to travel further than it was written to go -- into a chat
+ * channel, a phone. Swamp already redacts a model's declared global
+ * arguments, so a vaulted password shows as ***. What it cannot redact
+ * is a secret an upstream model put in the *body* of its own error.
+ *
+ * Every rule below redacts a value it can identify structurally, and
+ * leaves the surrounding text intact so the error stays diagnosable.
+ * Redaction is deliberately conservative: a missed secret is bad, but a
+ * mangled error the operator cannot act on defeats the whole tool.
+ * ------------------------------------------------------------------ */
+
+/** The outcome of redacting one error string. */
+export interface Redaction {
+  /** The text with identified secret values replaced. */
+  text: string;
+  /** How many values were replaced. */
+  count: number;
+  /** Which rules fired, for the operator to judge what was removed. */
+  kinds: string[];
+}
+
+interface RedactRule {
+  kind: string;
+  pattern: RegExp;
+  /** Replacement, using capture groups to keep the identifying context. */
+  replace: string;
+}
+
+/**
+ * Ordered redaction rules.
+ *
+ * Each keeps the key or scheme that identifies *what* was removed and blanks
+ * only the value, so `token=abc123` becomes `token=[redacted]` -- still
+ * obviously a token problem, no longer a leaked token.
+ */
+const REDACT_RULES: RedactRule[] = [
+  {
+    // Whole PEM blocks. First, because their body would otherwise be chewed
+    // on by the narrower rules below.
+    kind: "private-key",
+    pattern:
+      /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    replace: "[redacted:private-key]",
+  },
+  {
+    kind: "jwt",
+    pattern: /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}/g,
+    replace: "[redacted:jwt]",
+  },
+  {
+    kind: "url-credentials",
+    pattern: /([a-z][a-z0-9+.-]*:\/\/)([^\s:@/]+):([^\s@/]+)@/gi,
+    replace: "$1$2:[redacted]@",
+  },
+  {
+    kind: "authorization-header",
+    pattern: /\b(authorization\s*[:=]\s*)(?:(bearer|basic|token)\s+)?\S+/gi,
+    replace: "$1$2 [redacted]",
+  },
+  {
+    // Provider-shaped tokens, which are recognisable on their own.
+    kind: "provider-token",
+    pattern:
+      /\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{20,})\b/g,
+    replace: "[redacted:token]",
+  },
+  {
+    // Quoted JSON form: "password": "hunter2"
+    kind: "keyed-value",
+    pattern:
+      /(["'](?:password|passwd|pwd|secret|token|api[-_]?key|apikey|access[-_]?key|private[-_]?key|credential|auth)["']\s*:\s*)["'][^"']*["']/gi,
+    replace: '$1"[redacted]"',
+  },
+  {
+    // Bare form: password=hunter2, token: abc123, api_key => xyz
+    kind: "keyed-value",
+    pattern:
+      /\b(password|passwd|pwd|secret|token|api[-_]?key|apikey|access[-_]?key|private[-_]?key|credential)\b(\s*[:=]+\s*)(["']?)[^\s"'&,;)}\]]+\3/gi,
+    replace: "$1$2[redacted]",
+  },
+];
+
+/**
+ * Replace identifiable secret values in an error string.
+ *
+ * Deliberately structural: it redacts `password=<value>`, not the word
+ * "password". The controller error that motivated this model reads `Invalid
+ * username or password` and carries no value at all -- redacting that phrase
+ * would destroy the single most diagnostic sentence in the finding while
+ * protecting nothing.
+ *
+ * @param text Error text as recorded by the target's summary report.
+ * @returns The redacted text plus what was removed.
+ */
+export function redactSecrets(text: string | null | undefined): Redaction {
+  let out = text ?? "";
+  let count = 0;
+  const kinds: string[] = [];
+  for (const rule of REDACT_RULES) {
+    // Fresh lastIndex per use; these are global regexes.
+    rule.pattern.lastIndex = 0;
+    const hits = out.match(rule.pattern);
+    if (!hits || hits.length === 0) continue;
+    count += hits.length;
+    if (!kinds.includes(rule.kind)) kinds.push(rule.kind);
+    out = out.replace(rule.pattern, rule.replace);
+  }
+  return { text: out, count, kinds };
+}
+
 /**
  * Classify a recorded error string into an actionable category.
  *
@@ -483,6 +597,10 @@ const InvestigationSchema = z.object({
   failingMethod: z.string().nullable(),
   /** Set when a workflow failure was chased into the model that caused it. */
   rootCauseModel: z.string().nullable(),
+  /** How many secret values were redacted from the error before recording. */
+  redactions: z.number(),
+  /** Which kinds of secret were redacted, for judging what was removed. */
+  redactedKinds: z.array(z.string()),
   consecutiveFailures: z.number(),
   firstFailureAt: z.string().nullable(),
   lastSuccessAt: z.string().nullable(),
@@ -767,7 +885,23 @@ export const model = {
           }
         }
 
+        // Classify against the ORIGINAL text, then redact. Doing it the other
+        // way round would let redaction eat the evidence a rule matches on and
+        // silently downgrade a recognised failure to `unknown`.
         const classification = classifyError(error);
+        const redaction = redactSecrets(error);
+        error = error === null ? null : redaction.text;
+        if (redaction.count > 0) {
+          context.logger.warning(
+            "Redacted {count} secret value(s) ({kinds}) from {name}'s error " +
+              "before recording the finding",
+            {
+              count: redaction.count,
+              kinds: redaction.kinds.join(", "),
+              name: target.name,
+            },
+          );
+        }
         const failing = timeline.currentStatus !== "succeeded";
 
         const investigatedAt = isoTime(latest.createdAt);
@@ -808,6 +942,8 @@ export const model = {
             error,
             failingMethod,
             rootCauseModel,
+            redactions: redaction.count,
+            redactedKinds: redaction.kinds,
             consecutiveFailures: timeline.consecutiveFailures,
             firstFailureAt: timeline.firstFailure?.createdAt ?? null,
             lastSuccessAt: timeline.lastSuccess?.createdAt ?? null,

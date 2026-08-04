@@ -78,10 +78,43 @@ Next step: Check whether the secret was rotated on the remote, then update
 the vault key the model reads and re-run a read-only method to confirm.
 ```
 
-Wrap it in a workflow to go from alert to notification without opening a
-terminal — the target is a workflow input, so one workflow covers every model
-and workflow in the repo. See
-[Wrapping it in a workflow](./extensions/models/swamp-triage/README.md#wrapping-it-in-a-workflow).
+## Alert to notification
+
+Two workflows ship with the extension, so going from an alert to a notification
+takes no YAML of your own:
+
+```bash
+swamp workflow run @sntxrr/investigate-apprise --input target=<name>
+swamp workflow run @sntxrr/investigate-ntfy    --input target=<name>
+```
+
+| Workflow | Needs | Instance name |
+| --- | --- | --- |
+| `@sntxrr/investigate-apprise` | `@sntxrr/apprise-notify` | `apprise` |
+| `@sntxrr/investigate-ntfy` | `@mgreten/ntfy-notify` | `ntfy` |
+
+Prefer Apprise if you already run it — one endpoint fans out to ntfy *plus*
+Matrix, Discord, email and 100+ others, so it picks a gateway rather than a
+destination. Use ntfy to post directly with no Apprise server.
+
+They are two workflows rather than one with a switch because a step's model and
+method are static strings, and the notifiers differ in both. Adding a third
+transport is another workflow file, not a code change — and if you would rather
+wire your own, the model itself names no notifier at all.
+
+Both stay silent on a healthy target: notification is gated on the finding via a
+step `guard`, not on run status. Details, plus how to put a durable outbox in
+front, are in the
+[extension README](./extensions/models/swamp-triage/README.md#bundled-workflows).
+
+## Redaction
+
+Findings republish the target's recorded error, so the error text is redacted
+before it is written — private keys, JWTs, URL credentials, `Authorization`
+headers, provider-shaped tokens, and keyed values like `password=…`. Each rule
+keeps the key and blanks the value, so `token=abc123` becomes `token=[redacted]`
+and the error stays diagnosable. Redaction is structural, never lexical: the
+phrase `Invalid username or password` carries no value and is left alone.
 
 ## Development
 

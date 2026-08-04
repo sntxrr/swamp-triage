@@ -1,0 +1,21 @@
+swampVersion: 20260803.232525.0
+initializedAt: "2026-08-04T18:15:00.318Z"
+repoId: 5cf91c9b-6355-45fe-ab8a-25ba4a6e047a
+tools:
+  - claude
+gitignoreManaged: true
+
+# This repo is initialised local -- there is no datastore block, because
+# developing and publishing an extension needs no shared state. Copy this to
+# .swamp.yaml to bootstrap.
+#
+# If you later add a datastore here, the block names an S3 bucket. A bucket
+# name is the one piece of this file worth not publishing -- the bucket is
+# locked down, so the name is an information disclosure rather than an access
+# hole, but it still makes a target easier to find, and this repo is public.
+# .swamp.yaml is gitignored for that reason; only this .example copy is
+# tracked. Same convention as swamp-unifi and swamp-homelab.
+#
+#   swamp datastore setup extension @swamp/s3-datastore \
+#     --namespace "$(scutil --get ComputerName)-triage" \
+#     --config '{"bucket":"<bucket>","region":"<region>","prefix":"swamp"}'

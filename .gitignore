@@ -1,0 +1,33 @@
+# BEGIN swamp managed section - DO NOT EDIT
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# Claude Code configuration (managed by swamp)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+# END swamp managed section
+
+# --- site-specific, not part of the publishable extension ---
+# Model instances carry whatever host/username the target service needs, in
+# plaintext. Nothing in this repo needs them tracked -- the publishable unit is
+# extensions/models/swamp-triage/, and model instances are per-operator.
+/models/
+# Vault definitions point at local paths (secrets themselves live in .swamp/).
+/vaults/
+
+# .swamp.yaml carries the datastore block, which names an S3 bucket. The bucket
+# is locked down, so the name is an information disclosure rather than an access
+# hole -- but it still makes a target easier to find, and this repo is public.
+# Only .swamp.yaml.example is tracked. Same reasoning as swamp-unifi and
+# swamp-homelab, which both de-tracked this file for exactly this reason.
+#
+# There is no datastore block in it *today* -- this repo was initialised local
+# -- which is precisely why it is worth ignoring now rather than after one gets
+# added and quietly committed.
+.swamp.yaml

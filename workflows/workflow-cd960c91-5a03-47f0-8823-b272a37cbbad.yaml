@@ -1,5 +1,5 @@
 id: cd960c91-5a03-47f0-8823-b272a37cbbad
-name: @sntxrr/investigate-ntfy
+name: "@sntxrr/investigate-ntfy"
 description: >-
   Investigate why any model or workflow in this repo is failing, and post the
   finding straight to ntfy. Domain-agnostic: the target is named at run time,

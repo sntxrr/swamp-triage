@@ -1,5 +1,5 @@
 id: 1d18f54e-b7f1-433d-a5e1-0d37c79de3fd
-name: @sntxrr/investigate-apprise
+name: "@sntxrr/investigate-apprise"
 description: >-
   Investigate why any model or workflow in this repo is failing, and raise the
   finding through Apprise. Domain-agnostic: the target is named at run time, so

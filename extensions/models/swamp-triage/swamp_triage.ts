@@ -664,6 +664,38 @@ interface Context {
   };
 }
 
+/**
+ * The instance name a finding for `target` is stored under.
+ *
+ * Swamp rejects data names containing `/`, `\`, `..` or null bytes as path
+ * traversal. A collective-scoped name like `@acme/nightly-backup` therefore
+ * cannot be used verbatim -- and since bundling a workflow inside an extension
+ * *requires* that scoping, the targets most likely to need investigating were
+ * exactly the ones whose findings could not be written.
+ *
+ * Percent-encoded rather than folded to a plain separator. Folding `/` to `-`
+ * would map `@acme/thing` and `@acme-thing` onto one instance and silently
+ * interleave two targets' histories; encoding keeps the mapping injective.
+ * `%` is escaped first so the encoding cannot be forged by a name that already
+ * contains one. The finding's `target` field always carries the real,
+ * unmodified name.
+ *
+ * @param name Target name as the operator gave it.
+ * @returns A name safe to use as a data instance.
+ */
+export function sanitizeInstanceName(name: string): string {
+  const trimmed = name.trim();
+  if (trimmed === "") return "unnamed";
+  return trimmed
+    .replace(/%/g, "%25")
+    .replace(/\.\./g, "%2E%2E")
+    .replace(/\//g, "%2F")
+    .replace(/\\/g, "%5C")
+    // deno-lint-ignore no-control-regex
+    .replace(/\x00/g, "%00")
+    .replace(/\s/g, "%20");
+}
+
 /** Render the investigation as a paragraph an operator can act on directly. */
 function buildSummary(
   t: ResolvedTarget,
@@ -923,38 +955,60 @@ export const model = {
           },
         );
 
-        const handle = await context.writeResource(
+        const finding = {
+          target: target.name,
+          targetKind: target.kind,
+          targetType: target.type,
+          targetId: target.id,
+          definitionPath: target.definitionPath,
+          investigatedAt,
+          failing,
+          currentStatus: timeline.currentStatus,
+          category: classification.category,
+          categoryMatched: classification.matched,
+          meaning: classification.meaning,
+          nextStep: classification.nextStep,
+          error,
+          failingMethod,
+          rootCauseModel,
+          redactions: redaction.count,
+          redactedKinds: redaction.kinds,
+          consecutiveFailures: timeline.consecutiveFailures,
+          firstFailureAt: timeline.firstFailure?.createdAt ?? null,
+          lastSuccessAt: timeline.lastSuccess?.createdAt ?? null,
+          lastSuccessMethod: timeline.lastSuccess?.methodName ?? null,
+          successOutsideWindow: timeline.successOutsideWindow,
+          runsExamined: timeline.examined,
+          summary,
+        };
+
+        // Two instances of the same finding, deliberately.
+        //
+        // The per-target instance keeps history: investigate the same thing
+        // twice and the versions are comparable to each other. Its name is
+        // sanitized, because swamp rejects `/` in a data name and a bundled
+        // workflow's name is required to be collective-scoped.
+        //
+        // `current` is the stable handle a workflow can reference without
+        // knowing the target's name at all -- `data.latest('triage',
+        // 'current')`. Deriving the instance from the target meant the
+        // reference had to reproduce the sanitization in CEL, which is both
+        // awkward and one more place for the two to drift apart.
+        //
+        // Concurrent investigations race on `current`; the per-target instance
+        // is the one to read when that matters.
+        const perTarget = await context.writeResource(
           "investigation",
-          target.name,
-          {
-            target: target.name,
-            targetKind: target.kind,
-            targetType: target.type,
-            targetId: target.id,
-            definitionPath: target.definitionPath,
-            investigatedAt,
-            failing,
-            currentStatus: timeline.currentStatus,
-            category: classification.category,
-            categoryMatched: classification.matched,
-            meaning: classification.meaning,
-            nextStep: classification.nextStep,
-            error,
-            failingMethod,
-            rootCauseModel,
-            redactions: redaction.count,
-            redactedKinds: redaction.kinds,
-            consecutiveFailures: timeline.consecutiveFailures,
-            firstFailureAt: timeline.firstFailure?.createdAt ?? null,
-            lastSuccessAt: timeline.lastSuccess?.createdAt ?? null,
-            lastSuccessMethod: timeline.lastSuccess?.methodName ?? null,
-            successOutsideWindow: timeline.successOutsideWindow,
-            runsExamined: timeline.examined,
-            summary,
-          },
+          sanitizeInstanceName(target.name),
+          finding,
+        );
+        const current = await context.writeResource(
+          "investigation",
+          "current",
+          finding,
         );
 
-        return { dataHandles: [handle] };
+        return { dataHandles: [perTarget, current] };
       },
     },
   },

@@ -111,12 +111,15 @@ jobs:
           in `investigate-ntfy`, whose notifier has no such argument. The gate
           belongs to the decision, not to the transport.
 
-          The data name is the target's own name, so the reference is built
-          from the same input that selected the target -- there is no separate
-          place for the two to drift apart.
+          Reads the `current` instance rather than one named after the target.
+          Swamp rejects `/` in a data name, and a bundled workflow's name is
+          required to be collective-scoped -- so deriving the instance from the
+          target made exactly the targets worth investigating unstorable. The
+          model writes both: `current` for a stable reference, and a
+          percent-encoded per-target instance for history.
         guard: >-
           ${{ !inputs.notify ||
-          !data.latest('triage', inputs.target).attributes.failing }}
+          !data.latest('triage', 'current').attributes.failing }}
         task:
           type: model_method
           modelIdOrName: apprise
@@ -124,8 +127,8 @@ jobs:
           inputs:
             title: >-
               ${{ "Investigation: " + inputs.target + " (" +
-              data.latest('triage', inputs.target).attributes.category + ")" }}
-            body: ${{ data.latest('triage', inputs.target).attributes.summary }}
+              data.latest('triage', 'current').attributes.category + ")" }}
+            body: ${{ data.latest('triage', 'current').attributes.summary }}
             type: warning
             format: markdown
         dependsOn: []

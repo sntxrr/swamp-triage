@@ -5,6 +5,7 @@ import {
   redactSecrets,
   reconstructTimeline,
   resolveTargets,
+  sanitizeInstanceName,
   type RunPoint,
 } from "./swamp_triage.ts";
 
@@ -421,4 +422,45 @@ Deno.test("redact: classification is never degraded by redaction", () => {
   for (const [text, want] of cases) {
     assertEquals(classifyError(redactSecrets(text).text).category, want, text);
   }
+});
+
+/* ----------------------- instance-name safety --------------------- */
+
+Deno.test("instance name: a collective-scoped target is storable", () => {
+  // The bug this exists to prevent: swamp rejects '/' in a data name, and a
+  // bundled workflow's name is REQUIRED to be collective-scoped -- so the
+  // targets most worth investigating were the ones that could not be written.
+  const n = sanitizeInstanceName("@sntxrr/unifi-drift-watch");
+  assertEquals(n, "@sntxrr%2Funifi-drift-watch");
+  assertEquals(/[/\\]/.test(n), false);
+});
+
+Deno.test("instance name: an unscoped target is left alone", () => {
+  assertEquals(sanitizeInstanceName("nightly-backup"), "nightly-backup");
+  assertEquals(sanitizeInstanceName("home-udm"), "home-udm");
+});
+
+Deno.test("instance name: path traversal is defused", () => {
+  const n = sanitizeInstanceName("../../etc/passwd");
+  assertEquals(n.includes(".."), false);
+  assertEquals(n.includes("/"), false);
+});
+
+Deno.test("instance name: backslashes and whitespace are encoded", () => {
+  assertEquals(sanitizeInstanceName("a\\b c"), "a%5Cb%20c");
+});
+
+Deno.test("instance name: distinct targets cannot collide", () => {
+  // Encoding rather than folding is what keeps these apart -- mapping '/' to
+  // '-' would interleave two unrelated targets' histories under one instance.
+  assertEquals(sanitizeInstanceName("@acme/thing"), "@acme%2Fthing");
+  assertEquals(sanitizeInstanceName("@acme-thing"), "@acme-thing");
+  // And a name that already contains a percent cannot forge an encoding.
+  assertEquals(sanitizeInstanceName("a%2Fb") === sanitizeInstanceName("a/b"), false);
+});
+
+Deno.test("instance name: never returns empty", () => {
+  assertEquals(sanitizeInstanceName("///"), "%2F%2F%2F");
+  assertEquals(sanitizeInstanceName("   "), "unnamed");
+  assertEquals(sanitizeInstanceName(""), "unnamed");
 });

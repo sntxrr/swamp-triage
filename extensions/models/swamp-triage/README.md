@@ -53,9 +53,10 @@ swamp model @sntxrr/swamp-triage/investigation method run investigate <name> \
 
 Read-only. It never invokes the target it is investigating.
 
-Writes one `investigation` resource carrying the classification, the
-last-success/first-failure boundary, the verbatim error, and a `summary`
-paragraph suitable for a notification body.
+Writes the finding as an `investigation` resource — carrying the
+classification, the last-success/first-failure boundary, the redacted error, and
+a `summary` paragraph suitable for a notification body — under two instance
+names; see [Where a finding is stored](#where-a-finding-is-stored).
 
 ## Categories
 
@@ -89,9 +90,11 @@ The useful signal is not *that* something is failing — the alert already said
 so. It is the boundary: the last moment it worked and the first moment it
 didn't, because the cause is whatever happened in between.
 
-When no success appears anywhere in the retained history, the result carries
-`successOutsideRetention: true` rather than reporting the oldest retained
-failure as the start. A fabricated start time is worse than an admitted unknown.
+When no success appears anywhere in the examined window, the result carries
+`successOutsideWindow: true` rather than reporting the oldest retained failure
+as the start. The window is bounded by `maxVersions` as well as by retention, so
+the flag means "not found in what we looked at", never "it never worked". A
+fabricated start time is worse than an admitted unknown.
 
 ## Bundled workflows
 
@@ -131,7 +134,7 @@ healthy target completes successfully and sends nothing:
 ```yaml
 guard: >-
   ${{ !inputs.notify ||
-  !data.latest('triage', inputs.target).attributes.failing }}
+  !data.latest('triage', 'current').attributes.failing }}
 ```
 
 A `guard` is a CEL predicate evaluated before the step, where **truthy means
@@ -173,12 +176,12 @@ jobs:
           inputs:
             title: >-
               ${{ "Investigation: " + inputs.target + " (" +
-              data.latest('triage', inputs.target).attributes.category + ")" }}
-            body: ${{ data.latest('triage', inputs.target).attributes.summary }}
+              data.latest('triage', 'current').attributes.category + ")" }}
+            body: ${{ data.latest('triage', 'current').attributes.summary }}
             # Gate on the finding, not run status: a healthy target stays quiet.
-            when: >-
-              ${{ inputs.notify &&
-              data.latest('triage', inputs.target).attributes.failing }}
+            guard: >-
+              ${{ !inputs.notify ||
+              !data.latest('triage', 'current').attributes.failing }}
         allowFailure: true
     dependsOn:
       - job: investigate
@@ -217,6 +220,26 @@ per-run token you supply as a workflow input.
 
 Worth it for a noisy fleet where the same failure would otherwise page you
 hourly. Overkill for a handful of watchers, which is why it is not bundled.
+
+## Where a finding is stored
+
+Each run writes the same finding to two instances:
+
+| Instance | For |
+| --- | --- |
+| `current` | The stable handle to reference: `data.latest('triage', 'current')` |
+| percent-encoded target name | Per-target history, comparable across runs |
+
+Reference `current` from a workflow. Deriving the instance from the target name
+does not work in general: swamp rejects `/` in a data name, and a workflow
+bundled in an extension is *required* to be collective-scoped — so
+`@acme/nightly-backup` could not be stored at all. The per-target instance
+percent-encodes it (`@acme%2Fnightly-backup`) rather than folding the slash to
+a dash, which would map `@acme/thing` and `@acme-thing` onto one instance and
+interleave two unrelated targets' histories.
+
+Concurrent investigations race on `current`; read the per-target instance when
+that matters.
 
 ## What a finding contains
 

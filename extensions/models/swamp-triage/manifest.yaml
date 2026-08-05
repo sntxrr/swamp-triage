@@ -1,7 +1,7 @@
 manifestVersion: 1
 
 name: "@sntxrr/swamp-triage"
-version: "2026.08.04.3"
+version: "2026.08.04.4"
 description: "Investigate why any swamp model or workflow is failing, without knowing anything about the domain it automates. Every method and workflow run leaves a @swamp/method-summary or @swamp/workflow-summary report behind as versioned model data, written on failure as well as success — so the full history of a target is already on disk with nothing extra instrumented. `investigate` resolves a target by name at call time, walks that history back to the boundary where it stopped working, and classifies the error into auth / unreachable / timeout / tls / rate_limit / not_found / config, each with a concrete next step. The distinction it exists to make is auth vs unreachable: a remote answering 403 is healthy and rejecting your credential (go to the vault), while a remote that never answers is a network problem (go to the host) — the two read almost identically in a notification and lead opposite ways. Unrecognised errors are reported as `unknown` verbatim rather than filed under a plausible-looking category. Read-only: it reads what previous runs recorded and never invokes the failing target."
 repository: "https://github.com/sntxrr/swamp-triage"
 

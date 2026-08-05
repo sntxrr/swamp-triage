@@ -112,12 +112,15 @@ jobs:
           `@sntxrr/investigate-apprise` workflow uses; the gate belongs to the
           decision, not to the transport.
 
-          The data name is the target's own name, so the reference is built
-          from the same input that selected the target -- there is no separate
-          place for the two to drift apart.
+          Reads the `current` instance rather than one named after the target.
+          Swamp rejects `/` in a data name, and a bundled workflow's name is
+          required to be collective-scoped -- so deriving the instance from the
+          target made exactly the targets worth investigating unstorable. The
+          model writes both: `current` for a stable reference, and a
+          percent-encoded per-target instance for history.
         guard: >-
           ${{ !inputs.notify ||
-          !data.latest('triage', inputs.target).attributes.failing }}
+          !data.latest('triage', 'current').attributes.failing }}
         task:
           type: model_method
           modelIdOrName: ntfy
@@ -125,10 +128,10 @@ jobs:
           inputs:
             title: >-
               ${{ "Investigation: " + inputs.target + " (" +
-              data.latest('triage', inputs.target).attributes.category + ")" }}
+              data.latest('triage', 'current').attributes.category + ")" }}
             # `message`, not `body` -- ntfy's send takes a different argument
             # shape from Apprise's notify.
-            message: ${{ data.latest('triage', inputs.target).attributes.summary }}
+            message: ${{ data.latest('triage', 'current').attributes.summary }}
             # 4 = high. A watcher that has stopped watching is worth a nudge,
             # but this is a diagnosis of something already broken, not a new
             # emergency, so it is not 5/max.

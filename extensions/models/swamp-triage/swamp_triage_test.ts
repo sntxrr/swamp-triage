@@ -466,6 +466,17 @@ Deno.test("instance name: distinct targets cannot collide", () => {
   assertEquals(sanitizeInstanceName("a%2Fb") === sanitizeInstanceName("a/b"), false);
 });
 
+Deno.test("instance name: a target cannot overwrite a stable handle", () => {
+  // Reproduced before this rule: `investigate target=recent` replaced the
+  // list at data.latest('triage', 'recent') with a single finding.
+  assertEquals(sanitizeInstanceName("recent"), "%72ecent");
+  assertEquals(sanitizeInstanceName("current"), "%63urrent");
+  // Only the exact names are reserved.
+  assertEquals(sanitizeInstanceName("recent-sync"), "recent-sync");
+  // And a name that spells the encoding cannot forge it.
+  assertEquals(sanitizeInstanceName("%72ecent") === sanitizeInstanceName("recent"), false);
+});
+
 Deno.test("instance name: never returns empty", () => {
   assertEquals(sanitizeInstanceName("///"), "%2F%2F%2F");
   assertEquals(sanitizeInstanceName("   "), "unnamed");

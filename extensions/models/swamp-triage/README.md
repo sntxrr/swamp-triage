@@ -78,6 +78,12 @@ notification can arrive with no body, and "what just broke?" has no name in it.
 failing step, category and redacted error. Then `investigate` the one that
 matters for its full timeline.
 
+Each failure carries its `target` (instance or workflow name) **and**
+`targetType` (the model type, or `workflow`). Run history and many alerts name
+only a type, and one type can have dozens of instances; `targetType` is what
+maps `@acme/ssh/host failed` to the one instance that did, without searching
+the model catalog.
+
 It finds summaries with one `context.queryData` query across the whole repo
 rather than by walking definition files, so it also sees workflows bundled
 inside extensions, which have no file in `workflows/`. A summary's `status`

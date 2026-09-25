@@ -595,6 +595,8 @@ export interface SummaryHead {
   target: string;
   /** "model" or "workflow". */
   kind: string;
+  /** The model type (e.g. `@acme/thing`), or literal "workflow". */
+  type: string;
   /** When the report was written, ISO-8601 UTC. */
   createdAt: string;
   /** The parsed report body. */
@@ -605,6 +607,12 @@ export interface SummaryHead {
 export interface RecentFailure {
   target: string;
   kind: string;
+  /**
+   * The model type, or "workflow". A run-history line or an alert often names
+   * only the type, and one type has many instances; this is what maps one to
+   * the other without a catalog search.
+   */
+  targetType: string;
   failedAt: string;
   status: string;
   failingMethod: string | null;
@@ -676,6 +684,7 @@ export function describeFailure(
   return {
     target: head.target,
     kind: head.kind,
+    targetType: head.type,
     failedAt: head.createdAt,
     status: typeof body.status === "string" ? body.status : "unknown",
     failingMethod,
@@ -760,8 +769,11 @@ export function buildRecentSummary(
     );
     for (const f of sel.failures) {
       const where = f.failingMethod ? ` at \`${f.failingMethod}\`` : "";
+      // A model's type is what a run-history line names; show it so the two
+      // can be matched by eye.
+      const what = f.kind === "model" ? `model ${f.targetType}` : f.kind;
       lines.push(
-        `- ${f.target} (${f.kind})${where} — **${f.category}**, ${f.failedAt}`,
+        `- ${f.target} (${what})${where} — **${f.category}**, ${f.failedAt}`,
       );
     }
     if (sel.omitted > 0) {
@@ -827,6 +839,7 @@ const RecentSchema = z.object({
   failures: z.array(z.object({
     target: z.string(),
     kind: z.string(),
+    targetType: z.string(),
     failedAt: z.string(),
     status: z.string(),
     failingMethod: z.string().nullable(),
@@ -968,6 +981,7 @@ export async function readSummaryHeads(
       // untagged report is still listed, just less readably.
       target: rec.tags?.modelName ?? rec.modelId,
       kind: rec.name === WORKFLOW_SUMMARY ? "workflow" : "model",
+      type: rec.modelType,
       createdAt: isoTime(meta.createdAt),
       body,
     });
@@ -1066,12 +1080,18 @@ function buildSummary(
 
 export const model = {
   type: "@sntxrr/swamp-triage/investigation",
-  version: "2026.09.24.1",
+  version: "2026.09.25.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.09.24.1",
       description: "Add the `recent` method; global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.25.1",
+      description:
+        "`recent` reports each failure's targetType; global arguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

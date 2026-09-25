@@ -576,6 +576,211 @@ export async function resolveTargets(
 }
 
 /* ------------------------------------------------------------------ *
+ * Recent failures
+ *
+ * `investigate` needs a name, and an alert does not always carry one: a
+ * relayed notification can lose its body, and an operator asking "what
+ * just broke?" has no name to give. The summary reports that answer the
+ * question are already stored as data, so one query across every model
+ * finds them -- including workflows bundled inside extensions, which have
+ * no definition file in the repo for a name lookup to find.
+ * ------------------------------------------------------------------ */
+
+export const WORKFLOW_SUMMARY = "report-swamp-workflow-summary-json";
+export const METHOD_SUMMARY = "report-swamp-method-summary-json";
+
+/** The latest summary report of one target, as read back for `recent`. */
+export interface SummaryHead {
+  /** Definition name, from the report's `modelName` tag. */
+  target: string;
+  /** "model" or "workflow". */
+  kind: string;
+  /** When the report was written, ISO-8601 UTC. */
+  createdAt: string;
+  /** The parsed report body. */
+  body: Record<string, unknown>;
+}
+
+/** One target whose most recent run failed. */
+export interface RecentFailure {
+  target: string;
+  kind: string;
+  failedAt: string;
+  status: string;
+  failingMethod: string | null;
+  rootCauseModel: string | null;
+  category: string;
+  meaning: string;
+  nextStep: string;
+  error: string | null;
+  redactions: number;
+  redactedKinds: string[];
+}
+
+/** What `recent` found, before it is recorded. */
+export interface RecentSelection {
+  failures: RecentFailure[];
+  /** Failing targets inside the window beyond `limit`. */
+  omitted: number;
+  /**
+   * Targets still failing whose last run is older than the window -- a
+   * weekly job broken for days. Counted so a narrow window cannot make them
+   * read as healthy; widen the window to list them.
+   */
+  staleFailing: number;
+}
+
+/**
+ * Describe one failing summary: where it broke, and why.
+ *
+ * A workflow summary names the failing step but carries no error, so the
+ * step's model is looked up among the method summaries the same query
+ * already returned -- the same hop `investigate` makes, without a second
+ * read.
+ *
+ * @param head The failing target's latest summary.
+ * @param methodBodies Latest method-summary body per model name.
+ */
+export function describeFailure(
+  head: SummaryHead,
+  methodBodies: Map<string, Record<string, unknown>>,
+): RecentFailure {
+  const body = head.body;
+  let error = typeof body.error === "string" ? body.error : null;
+  let failingMethod = typeof body.methodName === "string"
+    ? body.methodName
+    : null;
+  let rootCauseModel: string | null = null;
+
+  if (error === null && Array.isArray(body.failures)) {
+    const first = (body.failures as Record<string, unknown>[])[0];
+    const stepModel = typeof first?.modelName === "string"
+      ? first.modelName
+      : null;
+    const stepMethod = typeof first?.methodName === "string"
+      ? first.methodName
+      : null;
+    if (stepModel) {
+      const sub = methodBodies.get(stepModel);
+      if (typeof sub?.error === "string") {
+        error = sub.error;
+        rootCauseModel = stepModel;
+      }
+      failingMethod = stepMethod ? `${stepModel} → ${stepMethod}` : stepModel;
+    }
+  }
+
+  // Classify before redacting, for the reason given in `investigate`.
+  const c = classifyError(error);
+  const r = redactSecrets(error);
+  return {
+    target: head.target,
+    kind: head.kind,
+    failedAt: head.createdAt,
+    status: typeof body.status === "string" ? body.status : "unknown",
+    failingMethod,
+    rootCauseModel,
+    category: c.category,
+    meaning: c.meaning,
+    nextStep: c.nextStep,
+    error: error === null ? null : r.text,
+    redactions: r.count,
+    redactedKinds: r.kinds,
+  };
+}
+
+/**
+ * Pick the targets whose most recent run failed within the window.
+ *
+ * Anything not an explicit success counts as a failure, as in
+ * `reconstructTimeline`. Results are newest first, so the thing that broke
+ * most recently -- usually the one an alert is about -- leads.
+ *
+ * @param heads Latest summary per target, any order.
+ * @param nowMs Reference time in epoch milliseconds.
+ * @param withinHours Window size.
+ * @param kind "model", "workflow", or "auto" for both.
+ * @param limit Maximum failures to return.
+ */
+export function selectRecentFailures(
+  heads: SummaryHead[],
+  nowMs: number,
+  withinHours: number,
+  kind: string,
+  limit: number,
+): RecentSelection {
+  const since = nowMs - withinHours * 3_600_000;
+  const methodBodies = new Map<string, Record<string, unknown>>();
+  for (const h of heads) {
+    if (h.kind === "model") methodBodies.set(h.target, h.body);
+  }
+
+  const inWindow: SummaryHead[] = [];
+  let staleFailing = 0;
+  for (const h of heads) {
+    if (kind !== "auto" && h.kind !== kind) continue;
+    if (h.body.status === "succeeded") continue;
+    const t = Date.parse(h.createdAt);
+    // An unreadable timestamp cannot be placed outside the window, so it is
+    // listed rather than dropped: missing a failure is the worse mistake.
+    if (!isNaN(t) && t < since) {
+      staleFailing++;
+      continue;
+    }
+    inWindow.push(h);
+  }
+  // Undated entries sort last rather than lexically ahead of every date.
+  const when = (h: SummaryHead) => {
+    const t = Date.parse(h.createdAt);
+    return isNaN(t) ? -Infinity : t;
+  };
+  inWindow.sort((a, b) => when(b) - when(a));
+
+  return {
+    failures: inWindow.slice(0, limit).map((h) =>
+      describeFailure(h, methodBodies)
+    ),
+    omitted: Math.max(0, inWindow.length - limit),
+    staleFailing,
+  };
+}
+
+/** Render a `recent` result as a paragraph for a notification or chat. */
+export function buildRecentSummary(
+  sel: RecentSelection,
+  withinHours: number,
+): string {
+  const lines: string[] = [];
+  if (sel.failures.length === 0) {
+    lines.push(`Nothing has failed in the last ${withinHours}h.`);
+  } else {
+    lines.push(
+      `${sel.failures.length + sel.omitted} target(s) failed in the last ` +
+        `${withinHours}h, newest first:`,
+    );
+    for (const f of sel.failures) {
+      const where = f.failingMethod ? ` at \`${f.failingMethod}\`` : "";
+      lines.push(
+        `- ${f.target} (${f.kind})${where} — **${f.category}**, ${f.failedAt}`,
+      );
+    }
+    if (sel.omitted > 0) {
+      lines.push(`- …and ${sel.omitted} more; raise \`limit\` to list them.`);
+    }
+    lines.push(
+      "Run `investigate` on one of these for its full timeline and next step.",
+    );
+  }
+  if (sel.staleFailing > 0) {
+    lines.push(
+      `${sel.staleFailing} other target(s) are still failing but last ran ` +
+        `before this window; widen \`withinHours\` to see them.`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/* ------------------------------------------------------------------ *
  * Model definition
  * ------------------------------------------------------------------ */
 
@@ -611,6 +816,36 @@ const InvestigationSchema = z.object({
   summary: z.string(),
 });
 
+const RecentSchema = z.object({
+  checkedAt: z.string(),
+  withinHours: z.number(),
+  /** Start of the window, ISO-8601 UTC. */
+  since: z.string(),
+  kind: z.string(),
+  /** How many targets' latest summary reports were read. */
+  summariesExamined: z.number(),
+  failures: z.array(z.object({
+    target: z.string(),
+    kind: z.string(),
+    failedAt: z.string(),
+    status: z.string(),
+    failingMethod: z.string().nullable(),
+    rootCauseModel: z.string().nullable(),
+    category: z.string(),
+    meaning: z.string(),
+    nextStep: z.string(),
+    error: z.string().nullable(),
+    redactions: z.number(),
+    redactedKinds: z.array(z.string()),
+  })),
+  /** Failing targets inside the window left out by `limit`. */
+  omitted: z.number(),
+  /** Targets still failing whose last run predates the window. */
+  staleFailing: z.number(),
+  /** Plain-language list, suitable for a notification body. */
+  summary: z.string(),
+});
+
 const GlobalArgsSchema = z.object({
   repoDir: z.string().optional().describe(
     "Repository root to investigate. Defaults to the repo the model runs in.",
@@ -636,6 +871,15 @@ function isoTime(value: string | Date | undefined): string {
   return isNaN(d.getTime()) ? "unknown" : d.toISOString();
 }
 
+/** The fields `recent` uses from a `queryData` result. */
+interface QueryRecord {
+  name: string;
+  version: number;
+  modelId: string;
+  modelType: string;
+  tags?: Record<string, string>;
+}
+
 interface Context {
   repoDir: string;
   globalArgs: z.infer<typeof GlobalArgsSchema>;
@@ -658,10 +902,77 @@ interface Context {
       version?: number,
     ) => Promise<Uint8Array | null>;
   };
+  /** Absent on runtimes that predate cross-model queries. */
+  queryData?: (predicate: string) => Promise<QueryRecord[]>;
   logger: {
     info: (msg: string, props?: unknown) => void;
     warning: (msg: string, props?: unknown) => void;
   };
+}
+
+/**
+ * Read the latest summary report of every model and workflow in the repo.
+ *
+ * One query finds every summary; each body is then read by its exact
+ * version. The query result's own attributes cannot be used for this: a
+ * summary is stored as a raw JSON report, not a resource, so `status` is not
+ * queryable and has to come from the content.
+ *
+ * A record that cannot be read or parsed is skipped rather than aborting the
+ * sweep -- one corrupt report must not hide every other failure.
+ *
+ * @returns The heads plus how many records were skipped.
+ */
+export async function readSummaryHeads(
+  context: Pick<Context, "queryData" | "dataRepository">,
+): Promise<{ heads: SummaryHead[]; skipped: number }> {
+  if (!context.queryData) {
+    throw new Error(
+      "This swamp runtime does not provide context.queryData, which `recent` " +
+        "needs to find summaries across models. Upgrade swamp, or use " +
+        "`investigate` with a target name.",
+    );
+  }
+  const records = await context.queryData(
+    `name == "${WORKFLOW_SUMMARY}" || name == "${METHOD_SUMMARY}"`,
+  );
+  const decoder = new TextDecoder();
+  const heads: SummaryHead[] = [];
+  let skipped = 0;
+  for (const rec of records) {
+    const meta = await context.dataRepository.findByName(
+      rec.modelType,
+      rec.modelId,
+      rec.name,
+      rec.version,
+    );
+    const bytes = await context.dataRepository.getContent(
+      rec.modelType,
+      rec.modelId,
+      rec.name,
+      rec.version,
+    );
+    if (!meta || !bytes) {
+      skipped++;
+      continue;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse(decoder.decode(bytes));
+    } catch {
+      skipped++;
+      continue;
+    }
+    heads.push({
+      // The tag carries the definition name; the id is the fallback so an
+      // untagged report is still listed, just less readably.
+      target: rec.tags?.modelName ?? rec.modelId,
+      kind: rec.name === WORKFLOW_SUMMARY ? "workflow" : "model",
+      createdAt: isoTime(meta.createdAt),
+      body,
+    });
+  }
+  return { heads, skipped };
 }
 
 /**
@@ -744,13 +1055,27 @@ function buildSummary(
 
 export const model = {
   type: "@sntxrr/swamp-triage/investigation",
-  version: "2026.08.04.1",
+  version: "2026.09.24.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.09.24.1",
+      description: "Add the `recent` method; global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     investigation: {
       description:
         "A classified finding for one investigated model or workflow.",
       schema: InvestigationSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 20,
+    },
+    recent: {
+      description:
+        "Every model and workflow whose most recent run failed within a window.",
+      schema: RecentSchema,
       lifetime: "infinite" as const,
       garbageCollection: 20,
     },
@@ -1009,6 +1334,78 @@ export const model = {
         );
 
         return { dataHandles: [perTarget, current] };
+      },
+    },
+    recent: {
+      description:
+        "List every model and workflow whose most recent run failed within " +
+        "the last `withinHours`, newest first, each with its failing step and " +
+        "error category. Needs no target name -- use it when an alert names " +
+        "nothing, then `investigate` the one that matters. Read-only.",
+      arguments: z.object({
+        withinHours: z.number().int().min(1).max(720).default(24).describe(
+          "How far back to look for failed runs.",
+        ),
+        kind: z.enum(["auto", "model", "workflow"]).default("auto").describe(
+          "Which targets to list. 'auto' lists models and workflows.",
+        ),
+        limit: z.number().int().min(1).max(100).default(20).describe(
+          "Maximum failures to list; the rest are counted, not dropped.",
+        ),
+      }),
+      execute: async (
+        args: { withinHours: number; kind: string; limit: number },
+        context: Context,
+      ) => {
+        const now = Date.now();
+        const { heads, skipped } = await readSummaryHeads(context);
+        if (skipped > 0) {
+          context.logger.warning(
+            "Skipped {count} summary report(s) that could not be read",
+            { count: skipped },
+          );
+        }
+
+        const sel = selectRecentFailures(
+          heads,
+          now,
+          args.withinHours,
+          args.kind,
+          args.limit,
+        );
+        const redactions = sel.failures.reduce((n, f) => n + f.redactions, 0);
+        if (redactions > 0) {
+          context.logger.warning(
+            "Redacted {count} secret value(s) from recorded errors before " +
+              "recording the list",
+            { count: redactions },
+          );
+        }
+        context.logger.info(
+          "{failing} failing in the last {hours}h ({stale} older), from " +
+            "{examined} summaries",
+          {
+            failing: sel.failures.length + sel.omitted,
+            hours: args.withinHours,
+            stale: sel.staleFailing,
+            examined: heads.length,
+          },
+        );
+
+        // One stable instance, overwritten each run, so a workflow can read
+        // `data.latest('triage', 'recent')` the way it reads `current`.
+        const handle = await context.writeResource("recent", "recent", {
+          checkedAt: new Date(now).toISOString(),
+          withinHours: args.withinHours,
+          since: new Date(now - args.withinHours * 3_600_000).toISOString(),
+          kind: args.kind,
+          summariesExamined: heads.length,
+          failures: sel.failures,
+          omitted: sel.omitted,
+          staleFailing: sel.staleFailing,
+          summary: buildRecentSummary(sel, args.withinHours),
+        });
+        return { dataHandles: [handle] };
       },
     },
   },

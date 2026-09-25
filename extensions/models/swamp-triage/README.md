@@ -36,7 +36,7 @@ a failing target — swamp has no cross-model method invocation. Reproduction
 stays a per-target step. In practice this matters less than it sounds, because
 the recorded error is the same error a reproduction would produce.
 
-## Method
+## Methods
 
 ### `investigate`
 
@@ -57,6 +57,42 @@ Writes the finding as an `investigation` resource — carrying the
 classification, the last-success/first-failure boundary, the redacted error, and
 a `summary` paragraph suitable for a notification body — under two instance
 names; see [Where a finding is stored](#where-a-finding-is-stored).
+
+### `recent`
+
+```
+swamp model @sntxrr/swamp-triage/investigation method run recent <name> \
+  withinHours=24
+```
+
+| Argument      | Default | Meaning                                                  |
+| ------------- | ------- | -------------------------------------------------------- |
+| `withinHours` | `24`    | How far back to look for failed runs (1–720)             |
+| `kind`        | `auto`  | `auto`, `model`, or `workflow`                           |
+| `limit`       | `20`    | Maximum failures to list; the rest are counted, not lost |
+
+`investigate` needs a name, and an alert does not always carry one: a relayed
+notification can arrive with no body, and "what just broke?" has no name in it.
+`recent` answers that question first. It lists every model and workflow whose
+**most recent** run failed within the window, newest first, each with its
+failing step, category and redacted error. Then `investigate` the one that
+matters for its full timeline.
+
+It finds summaries with one `context.queryData` query across the whole repo
+rather than by walking definition files, so it also sees workflows bundled
+inside extensions, which have no file in `workflows/`. A summary's `status`
+lives in its JSON content and is not queryable, so each latest summary is read
+once; a workflow failure is followed into its step's model from the same
+result set, as `investigate` does.
+
+A target that is still failing but last ran before the window, such as a
+weekly job broken for days, is counted in `staleFailing` rather than dropped,
+so a narrow window cannot make it read as healthy. The `repoDir` global
+argument does not apply: `recent` reads the datastore of the repo it runs in.
+It needs a swamp runtime that provides `context.queryData`, and says so rather
+than returning an empty list when it does not.
+
+Read-only, like `investigate`.
 
 ## Categories
 
@@ -223,7 +259,7 @@ hourly. Overkill for a handful of watchers, which is why it is not bundled.
 
 ## Where a finding is stored
 
-Each run writes the same finding to two instances:
+Each `investigate` run writes the same finding to two instances:
 
 | Instance | For |
 | --- | --- |
@@ -240,6 +276,10 @@ interleave two unrelated targets' histories.
 
 Concurrent investigations race on `current`; read the per-target instance when
 that matters.
+
+`recent` writes a `recent` resource to a single instance, also named `recent`,
+overwritten on every run: `data.latest('triage', 'recent')`. Its errors are
+redacted by the same rules below.
 
 ## What a finding contains
 

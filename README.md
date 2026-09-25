@@ -15,6 +15,7 @@ automates.
 | Method        | Writes? | What it does                                                     |
 | ------------- | ------- | ---------------------------------------------------------------- |
 | `investigate` | no      | Resolve a target by name, reconstruct when it broke, classify it |
+| `recent`      | no      | List everything whose latest run failed in a window, no name needed |
 
 Every method and workflow run already leaves a `@swamp/method-summary` or
 `@swamp/workflow-summary` report behind as versioned model data, written on
@@ -61,6 +62,10 @@ swamp model @sntxrr/swamp-triage/investigation method run investigate triage \
 
 # Read the finding
 swamp data get triage nightly-backup --json | jq -r '.content' | jq -r '.summary'
+
+# No name to go on? List what failed in the last day first
+swamp model @sntxrr/swamp-triage/investigation method run recent triage
+swamp data get triage recent --json | jq -r '.content' | jq -r '.summary'
 ```
 
 A finding reads like this:

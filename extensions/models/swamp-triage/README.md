@@ -281,6 +281,10 @@ that matters.
 overwritten on every run: `data.latest('triage', 'recent')`. Its errors are
 redacted by the same rules below.
 
+`current` and `recent` are reserved. A target with exactly one of those names
+has its per-target instance's first character encoded too (`%72ecent`), so
+investigating it cannot overwrite the handle a workflow reads.
+
 ## What a finding contains
 
 The finding republishes the error string the target's own summary report

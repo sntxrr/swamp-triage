@@ -997,7 +997,7 @@ export async function readSummaryHeads(
 export function sanitizeInstanceName(name: string): string {
   const trimmed = name.trim();
   if (trimmed === "") return "unnamed";
-  return trimmed
+  const encoded = trimmed
     .replace(/%/g, "%25")
     .replace(/\.\./g, "%2E%2E")
     .replace(/\//g, "%2F")
@@ -1005,7 +1005,18 @@ export function sanitizeInstanceName(name: string): string {
     // deno-lint-ignore no-control-regex
     .replace(/\x00/g, "%00")
     .replace(/\s/g, "%20");
+  // `current` and `recent` are the stable handles. A target with one of those
+  // names would overwrite the handle with a per-target finding, so its first
+  // character is encoded too. Still injective: a literal `%` became `%25`.
+  if (RESERVED_INSTANCES.has(encoded)) {
+    return `%${encoded.charCodeAt(0).toString(16).toUpperCase()}` +
+      encoded.slice(1);
+  }
+  return encoded;
 }
+
+/** Instance names the model writes to on every run, whatever the target. */
+const RESERVED_INSTANCES = new Set(["current", "recent"]);
 
 /** Render the investigation as a paragraph an operator can act on directly. */
 function buildSummary(
@@ -1358,6 +1369,10 @@ export const model = {
         context: Context,
       ) => {
         const now = Date.now();
+        context.logger.info(
+          "Listing {kind} targets that failed in the last {hours}h",
+          { kind: args.kind, hours: args.withinHours },
+        );
         const { heads, skipped } = await readSummaryHeads(context);
         if (skipped > 0) {
           context.logger.warning(

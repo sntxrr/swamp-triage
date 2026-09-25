@@ -1369,6 +1369,10 @@ export const model = {
         context: Context,
       ) => {
         const now = Date.now();
+        context.logger.info(
+          "Listing {kind} targets that failed in the last {hours}h",
+          { kind: args.kind, hours: args.withinHours },
+        );
         const { heads, skipped } = await readSummaryHeads(context);
         if (skipped > 0) {
           context.logger.warning(

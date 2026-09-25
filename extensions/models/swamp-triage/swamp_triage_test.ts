@@ -492,7 +492,8 @@ const head = (
   kind: string,
   createdAt: string,
   body: Record<string, unknown>,
-): SummaryHead => ({ target, kind, createdAt, body });
+  type = kind === "workflow" ? "workflow" : "@acme/thing",
+): SummaryHead => ({ target, kind, type, createdAt, body });
 
 Deno.test("recent: lists only targets whose latest run failed, newest first", () => {
   const sel = selectRecentFailures(
@@ -698,6 +699,8 @@ Deno.test("recent: reads every summary by exact version and names it by tag", as
     ["m-1", "model"],
   ]);
   assertEquals(heads[0].createdAt, "2026-08-04T17:00:00.000Z");
+  // The repository type key travels with the head: "workflow", or the model type.
+  assertEquals(heads.map((h) => h.type), ["workflow", "@acme/thing"]);
 });
 
 Deno.test("recent: an unreadable or corrupt summary is skipped, not fatal", async () => {
@@ -740,4 +743,34 @@ Deno.test("recent: a runtime without queryData fails loudly", async () => {
     message = (err as Error).message;
   }
   assertEquals(message.includes("queryData"), true);
+});
+
+Deno.test("recent: each failure carries its model type", () => {
+  // The case this exists for: a run-history line names only a type, and the
+  // type has several instances. Only the failing one should come back, and it
+  // must be recognisable as an instance of that type without a catalog search.
+  const sel = selectRecentFailures(
+    [
+      head("docker-ssh", "model", "2026-08-04T17:00:00Z", {
+        status: "failed",
+        methodName: "exec",
+        error: "connect ECONNREFUSED 192.0.2.7:22",
+      }, "@acme/ssh/host"),
+      head("sinner-ssh", "model", "2026-08-04T16:00:00Z", {
+        status: "succeeded",
+      }, "@acme/ssh/host"),
+      head("nightly", "workflow", "2026-08-04T15:00:00Z", { status: "failed" }),
+    ],
+    NOW,
+    24,
+    "auto",
+    20,
+  );
+  assertEquals(
+    sel.failures.map((f) => [f.target, f.targetType]),
+    [["docker-ssh", "@acme/ssh/host"], ["nightly", "workflow"]],
+  );
+  const text = buildRecentSummary(sel, 24);
+  assertEquals(text.includes("docker-ssh (model @acme/ssh/host)"), true);
+  assertEquals(text.includes("nightly (workflow)"), true);
 });

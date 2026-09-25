@@ -1,12 +1,19 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
+  buildRecentSummary,
   classifyError,
+  describeFailure,
+  METHOD_SUMMARY,
+  readSummaryHeads,
   readTopLevelScalars,
   redactSecrets,
   reconstructTimeline,
   resolveTargets,
   sanitizeInstanceName,
+  selectRecentFailures,
   type RunPoint,
+  type SummaryHead,
+  WORKFLOW_SUMMARY,
 } from "./swamp_triage.ts";
 
 /**
@@ -463,4 +470,263 @@ Deno.test("instance name: never returns empty", () => {
   assertEquals(sanitizeInstanceName("///"), "%2F%2F%2F");
   assertEquals(sanitizeInstanceName("   "), "unnamed");
   assertEquals(sanitizeInstanceName(""), "unnamed");
+});
+
+/* ------------------------- recent failures ------------------------ */
+
+const NOW = Date.parse("2026-08-04T18:00:00Z");
+
+const head = (
+  target: string,
+  kind: string,
+  createdAt: string,
+  body: Record<string, unknown>,
+): SummaryHead => ({ target, kind, createdAt, body });
+
+Deno.test("recent: lists only targets whose latest run failed, newest first", () => {
+  const sel = selectRecentFailures(
+    [
+      head("green", "model", "2026-08-04T17:59:00Z", { status: "succeeded" }),
+      head("older", "model", "2026-08-04T10:00:00Z", {
+        status: "failed",
+        error: "connect ECONNREFUSED 192.0.2.1:443",
+      }),
+      head("newer", "model", "2026-08-04T17:00:00Z", {
+        status: "failed",
+        error: "401 Unauthorized",
+      }),
+    ],
+    NOW,
+    24,
+    "auto",
+    20,
+  );
+  assertEquals(sel.failures.map((f) => f.target), ["newer", "older"]);
+  assertEquals(sel.failures.map((f) => f.category), ["auth", "unreachable"]);
+});
+
+Deno.test("recent: a failure older than the window is counted, not dropped", () => {
+  // A weekly job broken for days is still broken. A narrow window must not
+  // make it read as healthy -- the caller is told how many to widen for.
+  const sel = selectRecentFailures(
+    [head("weekly", "workflow", "2026-07-30T00:00:00Z", { status: "failed" })],
+    NOW,
+    24,
+    "auto",
+    20,
+  );
+  assertEquals(sel.failures.length, 0);
+  assertEquals(sel.staleFailing, 1);
+  assertEquals(buildRecentSummary(sel, 24).includes("1 other target"), true);
+});
+
+Deno.test("recent: any non-success status is a failure", () => {
+  const sel = selectRecentFailures(
+    [head("x", "workflow", "2026-08-04T17:00:00Z", { status: "cancelled" })],
+    NOW,
+    24,
+    "auto",
+    20,
+  );
+  assertEquals(sel.failures[0]?.status, "cancelled");
+});
+
+Deno.test("recent: an undated failure is listed, and sorts last", () => {
+  // Missing a failure is the worse mistake than listing one we cannot date.
+  const sel = selectRecentFailures(
+    [
+      head("undated", "model", "unknown", { status: "failed" }),
+      head("dated", "model", "2026-08-04T17:00:00Z", { status: "failed" }),
+    ],
+    NOW,
+    1,
+    "auto",
+    20,
+  );
+  assertEquals(sel.failures.map((f) => f.target), ["dated", "undated"]);
+});
+
+Deno.test("recent: limit truncates the list but counts the rest", () => {
+  const heads = [1, 2, 3].map((i) =>
+    head(`t${i}`, "model", `2026-08-04T1${i}:00:00Z`, { status: "failed" })
+  );
+  const sel = selectRecentFailures(heads, NOW, 24, "auto", 2);
+  assertEquals(sel.failures.map((f) => f.target), ["t3", "t2"]);
+  assertEquals(sel.omitted, 1);
+  assertEquals(buildRecentSummary(sel, 24).startsWith("3 target(s)"), true);
+});
+
+Deno.test("recent: kind filters the list but not the root-cause lookup", () => {
+  const sel = selectRecentFailures(
+    [
+      head("nightly", "workflow", "2026-08-04T17:00:00Z", {
+        status: "failed",
+        failures: [{ modelName: "home-udm", methodName: "drift" }],
+      }),
+      head("home-udm", "model", "2026-08-04T16:59:00Z", {
+        status: "failed",
+        methodName: "drift",
+        error: "UniFi login to 192.0.2.1 failed (403)",
+      }),
+    ],
+    NOW,
+    24,
+    "workflow",
+    20,
+  );
+  assertEquals(sel.failures.length, 1);
+  assertEquals(sel.failures[0].failingMethod, "home-udm → drift");
+  assertEquals(sel.failures[0].rootCauseModel, "home-udm");
+  assertEquals(sel.failures[0].category, "auth");
+});
+
+Deno.test("recent: a workflow whose step model left no error still names the step", () => {
+  // An assert or expression step records no model error. The step name is
+  // still the most useful thing to report, and the category is honestly none.
+  const f = describeFailure(
+    head("nightly", "workflow", "2026-08-04T17:00:00Z", {
+      status: "failed",
+      failures: [{ modelName: "gate", methodName: "check" }],
+    }),
+    new Map(),
+  );
+  assertEquals(f.failingMethod, "gate → check");
+  assertEquals(f.rootCauseModel, null);
+  assertEquals(f.category, "none");
+});
+
+Deno.test("recent: errors are redacted after classification", () => {
+  const f = describeFailure(
+    head("x", "model", "2026-08-04T17:00:00Z", {
+      status: "failed",
+      error: "403 Forbidden: token=abc123",
+    }),
+    new Map(),
+  );
+  assertEquals(f.category, "auth");
+  assertEquals(f.error?.includes("abc123"), false);
+  assertEquals(f.redactions, 1);
+});
+
+Deno.test("recent: nothing failing says so plainly", () => {
+  const sel = selectRecentFailures([], NOW, 24, "auto", 20);
+  assertEquals(buildRecentSummary(sel, 24), "Nothing has failed in the last 24h.");
+});
+
+/** A fake data repository keyed by `${type}|${id}|${name}|${version}`. */
+function fakeContext(
+  records: {
+    name: string;
+    version: number;
+    modelId: string;
+    modelType: string;
+    tags?: Record<string, string>;
+    createdAt?: string;
+    content?: string;
+  }[],
+) {
+  const key = (t: string, i: string, n: string, v?: number) =>
+    `${t}|${i}|${n}|${v}`;
+  const byKey = new Map(
+    records.map((r) => [key(r.modelType, r.modelId, r.name, r.version), r]),
+  );
+  const predicates: string[] = [];
+  return {
+    predicates,
+    context: {
+      queryData: (predicate: string) => {
+        predicates.push(predicate);
+        return Promise.resolve(records);
+      },
+      dataRepository: {
+        findByName: (t: string, i: string, n: string, v?: number) => {
+          const r = byKey.get(key(t, i, n, v));
+          return Promise.resolve(
+            r?.createdAt ? { version: r.version, createdAt: r.createdAt } : null,
+          );
+        },
+        getContent: (t: string, i: string, n: string, v?: number) => {
+          const r = byKey.get(key(t, i, n, v));
+          return Promise.resolve(
+            r?.content === undefined
+              ? null
+              : new TextEncoder().encode(r.content),
+          );
+        },
+      },
+    },
+  };
+}
+
+Deno.test("recent: reads every summary by exact version and names it by tag", async () => {
+  const { context, predicates } = fakeContext([
+    {
+      name: WORKFLOW_SUMMARY,
+      version: 7,
+      modelId: "w-1",
+      modelType: "workflow",
+      tags: { modelName: "@acme/nightly" },
+      createdAt: "2026-08-04T17:00:00Z",
+      content: '{"status":"failed"}',
+    },
+    {
+      name: METHOD_SUMMARY,
+      version: 3,
+      modelId: "m-1",
+      modelType: "@acme/thing",
+      createdAt: "2026-08-04T16:00:00Z",
+      content: '{"status":"succeeded"}',
+    },
+  ]);
+  const { heads, skipped } = await readSummaryHeads(context);
+  assertEquals(skipped, 0);
+  assertEquals(predicates.length, 1);
+  assertEquals(heads.map((h) => [h.target, h.kind]), [
+    ["@acme/nightly", "workflow"],
+    // No modelName tag: fall back to the id rather than dropping the target.
+    ["m-1", "model"],
+  ]);
+  assertEquals(heads[0].createdAt, "2026-08-04T17:00:00.000Z");
+});
+
+Deno.test("recent: an unreadable or corrupt summary is skipped, not fatal", async () => {
+  const { context } = fakeContext([
+    {
+      name: METHOD_SUMMARY,
+      version: 1,
+      modelId: "gone",
+      modelType: "@acme/thing",
+    },
+    {
+      name: METHOD_SUMMARY,
+      version: 1,
+      modelId: "corrupt",
+      modelType: "@acme/thing",
+      createdAt: "2026-08-04T16:00:00Z",
+      content: "{not json",
+    },
+    {
+      name: METHOD_SUMMARY,
+      version: 2,
+      modelId: "ok",
+      modelType: "@acme/thing",
+      tags: { modelName: "widget" },
+      createdAt: "2026-08-04T16:00:00Z",
+      content: '{"status":"failed"}',
+    },
+  ]);
+  const { heads, skipped } = await readSummaryHeads(context);
+  assertEquals(skipped, 2);
+  assertEquals(heads.map((h) => h.target), ["widget"]);
+});
+
+Deno.test("recent: a runtime without queryData fails loudly", async () => {
+  const { context } = fakeContext([]);
+  let message = "";
+  try {
+    await readSummaryHeads({ ...context, queryData: undefined });
+  } catch (err) {
+    message = (err as Error).message;
+  }
+  assertEquals(message.includes("queryData"), true);
 });

@@ -57,12 +57,20 @@ interface Rule {
   nextStep: string;
 }
 
+const UNREACHABLE_MEANING =
+  "The remote never answered. This is a network, DNS or host-down " +
+  "problem, not a credential problem.";
+const UNREACHABLE_NEXT_STEP =
+  "Confirm the host is up and routable from wherever swamp runs, " +
+  "including any tailnet or VPN the address depends on.";
+
 /**
  * Ordered classification rules; the first match wins.
  *
  * Order matters where categories overlap. Auth precedes the generic HTTP
  * buckets because a 403 carrying "invalid credentials" is an auth problem
- * first and an HTTP status second.
+ * first and an HTTP status second. Generic wrappers go last, so any specific
+ * cause they carry is matched first.
  */
 const RULES: Rule[] = [
   {
@@ -102,10 +110,8 @@ const RULES: Rule[] = [
       /dns/i,
       /getaddrinfo/i,
     ],
-    meaning: "The remote never answered. This is a network, DNS or host-down " +
-      "problem, not a credential problem.",
-    nextStep: "Confirm the host is up and routable from wherever swamp runs, " +
-      "including any tailnet or VPN the address depends on.",
+    meaning: UNREACHABLE_MEANING,
+    nextStep: UNREACHABLE_NEXT_STEP,
   },
   {
     category: "timeout",
@@ -179,6 +185,15 @@ const RULES: Rule[] = [
     nextStep:
       "Compare the inputs the run recorded against the method's argument " +
       "schema with `swamp model type describe`.",
+  },
+  {
+    // `fetch` throws `TypeError: fetch failed` when no connection was made,
+    // and puts the reason -- if any -- beside it. Last, so that reason wins:
+    // `fetch failed ... ETIMEDOUT` is a timeout, a bare `fetch failed` is not.
+    category: "unreachable",
+    patterns: [/fetch failed/i],
+    meaning: UNREACHABLE_MEANING,
+    nextStep: UNREACHABLE_NEXT_STEP,
   },
 ];
 
@@ -303,13 +318,31 @@ export function redactSecrets(text: string | null | undefined): Redaction {
  * an unrecognised error is visibly unrecognised instead of being filed under a
  * plausible-looking category that sends the operator the wrong way.
  *
+ * A missing error means two different things depending on whether the run
+ * failed, so the caller says which. A target that did not fail is `none`; one
+ * that failed with no recoverable text is `unrecorded` -- distinct from
+ * `unknown`, which means there was text and no rule matched it.
+ *
  * @param error The error text recorded by the summary report.
+ * @param failed Whether the run the error belongs to failed.
  * @returns The matched category with its meaning and next step.
  */
 export function classifyError(
   error: string | null | undefined,
+  failed = false,
 ): Classification {
   const text = (error ?? "").trim();
+  if (text === "" && failed) {
+    return {
+      category: "unrecorded",
+      matched: false,
+      meaning: "The run failed, but no error text was recorded or could be " +
+        "recovered -- typically an assert or expression step, or a step " +
+        "model whose latest summary belongs to a later, successful run.",
+      nextStep: "Open the failing run's own summary with `swamp workflow " +
+        "history logs` or `swamp report get`; the cause is there, not here.",
+    };
+  }
   if (text === "") {
     return {
       category: "none",
@@ -679,7 +712,8 @@ export function describeFailure(
   }
 
   // Classify before redacting, for the reason given in `investigate`.
-  const c = classifyError(error);
+  // Only failing heads reach here, but the status decides, not the caller.
+  const c = classifyError(error, body.status !== "succeeded");
   const r = redactSecrets(error);
   return {
     target: head.target,
@@ -1080,7 +1114,7 @@ function buildSummary(
 
 export const model = {
   type: "@sntxrr/swamp-triage/investigation",
-  version: "2026.09.25.1",
+  version: "2026.09.26.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1092,6 +1126,12 @@ export const model = {
       toVersion: "2026.09.25.1",
       description:
         "`recent` reports each failure's targetType; global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.26.1",
+      description: "`fetch failed` classifies as unreachable, and a failure " +
+        "with no error text as `unrecorded`; global arguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1276,7 +1316,8 @@ export const model = {
         // Classify against the ORIGINAL text, then redact. Doing it the other
         // way round would let redaction eat the evidence a rule matches on and
         // silently downgrade a recognised failure to `unknown`.
-        const classification = classifyError(error);
+        const failing = timeline.currentStatus !== "succeeded";
+        const classification = classifyError(error, failing);
         const redaction = redactSecrets(error);
         error = error === null ? null : redaction.text;
         if (redaction.count > 0) {
@@ -1290,7 +1331,6 @@ export const model = {
             },
           );
         }
-        const failing = timeline.currentStatus !== "succeeded";
 
         const investigatedAt = isoTime(latest.createdAt);
         const summary = buildSummary(

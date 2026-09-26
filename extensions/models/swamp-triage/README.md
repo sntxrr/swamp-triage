@@ -114,6 +114,7 @@ The categories are chosen by **where they send you**, not by protocol trivia.
 | `not_found`   | Answered, but the addressed resource is gone             |
 | `config`      | Never left swamp — arguments failed validation           |
 | `unknown`     | No rule matched; reported verbatim rather than guessed   |
+| `unrecorded`  | Failed, but no error text was recorded or recoverable    |
 | `none`        | No error recorded; the target is not failing             |
 
 The distinction this exists to make is **`auth` vs `unreachable`**. A controller
@@ -125,6 +126,12 @@ directions, and guessing wrong wastes the outage.
 `unknown` is deliberate. Filing an unrecognised error under a plausible-looking
 category would send an operator the wrong way with false confidence; being
 visibly unrecognised is the more useful answer.
+
+`unrecorded` is kept apart from both. `unknown` means there was text and no rule
+matched it, so a new rule is the fix; `unrecorded` means the run failed and left
+no text to match -- an assert step, or a step model that has succeeded since and
+so no longer carries the error -- so the fix is to read that run's own summary.
+Reporting it as `none` would say "not failing" beside `status=failed`.
 
 ## The timeline
 

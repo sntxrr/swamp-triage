@@ -38,6 +38,7 @@ stopping there reports `detect-drift failed` and omits the actual cause.
 | `not_found`   | Answered, but the addressed resource is gone             |
 | `config`      | Never left swamp — arguments failed validation           |
 | `unknown`     | No rule matched; reported verbatim rather than guessed   |
+| `unrecorded`  | Failed, but no error text was recorded or recoverable    |
 | `none`        | No error recorded; the target is not failing             |
 
 The distinction it exists to make is **`auth` vs `unreachable`**: a controller

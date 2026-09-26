@@ -4,14 +4,15 @@ import {
   classifyError,
   describeFailure,
   METHOD_SUMMARY,
+  model,
   readSummaryHeads,
   readTopLevelScalars,
-  redactSecrets,
   reconstructTimeline,
+  redactSecrets,
   resolveTargets,
+  type RunPoint,
   sanitizeInstanceName,
   selectRecentFailures,
-  type RunPoint,
   type SummaryHead,
   WORKFLOW_SUMMARY,
 } from "./swamp_triage.ts";
@@ -43,7 +44,10 @@ Deno.test("classify: a refused connection is unreachable, not auth", () => {
 });
 
 Deno.test("classify: expired token is auth", () => {
-  assertEquals(classifyError("401 Unauthorized: token has expired").category, "auth");
+  assertEquals(
+    classifyError("401 Unauthorized: token has expired").category,
+    "auth",
+  );
 });
 
 Deno.test("classify: timeout is distinct from unreachable", () => {
@@ -52,7 +56,10 @@ Deno.test("classify: timeout is distinct from unreachable", () => {
 });
 
 Deno.test("classify: 429 is rate_limit, not auth", () => {
-  assertEquals(classifyError("HTTP 429 Too Many Requests").category, "rate_limit");
+  assertEquals(
+    classifyError("HTTP 429 Too Many Requests").category,
+    "rate_limit",
+  );
 });
 
 Deno.test("classify: certificate problems surface as tls", () => {
@@ -80,9 +87,59 @@ Deno.test("classify: no error is 'none', not 'unknown'", () => {
   assertEquals(classifyError("   ").category, "none");
 });
 
+Deno.test("classify: a fetch that never connected is unreachable", () => {
+  // The runtime's generic message when no connection was made. It names no
+  // code, so without its own pattern it fell through to `unknown`.
+  const c = classifyError(
+    "Apprise POST http://apprise.example:8000/notify/k failed: TypeError: fetch failed",
+  );
+  assertEquals(c.category, "unreachable");
+  assertEquals(c.matched, true);
+});
+
+Deno.test("classify: a specific cause beside 'fetch failed' wins over it", () => {
+  // `fetch failed` is only the wrapper; the cause it carries is the more
+  // specific signal, whichever rule it belongs to.
+  const cases: [string, string][] = [
+    [
+      "TypeError: fetch failed (cause: connect ETIMEDOUT 192.0.2.1:443)",
+      "timeout",
+    ],
+    ["TypeError: fetch failed [cause: UND_ERR_CONNECT_TIMEOUT]", "timeout"],
+    ["TypeError: fetch failed: certificate has expired", "tls"],
+    [
+      "TypeError: fetch failed: connect ECONNREFUSED 192.0.2.1:443",
+      "unreachable",
+    ],
+  ];
+  for (const [text, want] of cases) {
+    assertEquals(classifyError(text).category, want, text);
+  }
+});
+
+Deno.test("classify: a failed run with no error text is unrecorded, not none", () => {
+  // `none` means "not failing"; saying that beside status=failed is a lie.
+  // Nor is it `unknown`, which means text was present and matched no rule.
+  for (const error of [null, undefined, "", "   "]) {
+    const c = classifyError(error, true);
+    assertEquals(c.category, "unrecorded", String(error));
+    assertEquals(c.matched, false);
+  }
+  // Negative control: a target that is not failing is still `none`.
+  assertEquals(classifyError(null, false).category, "none");
+  assertEquals(classifyError("").category, "none");
+  // Text that is present classifies the same whether or not it failed.
+  assertEquals(classifyError("HTTP 429", true).category, "rate_limit");
+});
+
 /* ---------------------------- timeline ---------------------------- */
 
-const at = (v: number, iso: string, status: string, error?: string): RunPoint => ({
+const at = (
+  v: number,
+  iso: string,
+  status: string,
+  error?: string,
+): RunPoint => ({
   version: v,
   createdAt: iso,
   status,
@@ -274,7 +331,9 @@ Deno.test("resolve: a definition with no id is skipped, not half-returned", asyn
 /* --------------------- top-level scalar reader -------------------- */
 
 Deno.test("scalars: reads plain top-level fields", () => {
-  const d = readTopLevelScalars("type: '@acme/thing'\nid: abc-123\nname: widget\n");
+  const d = readTopLevelScalars(
+    "type: '@acme/thing'\nid: abc-123\nname: widget\n",
+  );
   assertEquals(d.type, "@acme/thing");
   assertEquals(d.id, "abc-123");
   assertEquals(d.name, "widget");
@@ -367,8 +426,13 @@ Deno.test("redact: quoted JSON secrets are caught", () => {
 });
 
 Deno.test("redact: credentials embedded in a URL", () => {
-  const r = redactSecrets("failed to reach https://admin:s3cr3t@example.com/api");
-  assertEquals(r.text, "failed to reach https://admin:[redacted]@example.com/api");
+  const r = redactSecrets(
+    "failed to reach https://admin:s3cr3t@example.com/api",
+  );
+  assertEquals(
+    r.text,
+    "failed to reach https://admin:[redacted]@example.com/api",
+  );
   assertEquals(r.kinds.includes("url-credentials"), true);
 });
 
@@ -463,7 +527,10 @@ Deno.test("instance name: distinct targets cannot collide", () => {
   assertEquals(sanitizeInstanceName("@acme/thing"), "@acme%2Fthing");
   assertEquals(sanitizeInstanceName("@acme-thing"), "@acme-thing");
   // And a name that already contains a percent cannot forge an encoding.
-  assertEquals(sanitizeInstanceName("a%2Fb") === sanitizeInstanceName("a/b"), false);
+  assertEquals(
+    sanitizeInstanceName("a%2Fb") === sanitizeInstanceName("a/b"),
+    false,
+  );
 });
 
 Deno.test("instance name: a target cannot overwrite a stable handle", () => {
@@ -474,7 +541,10 @@ Deno.test("instance name: a target cannot overwrite a stable handle", () => {
   // Only the exact names are reserved.
   assertEquals(sanitizeInstanceName("recent-sync"), "recent-sync");
   // And a name that spells the encoding cannot forge it.
-  assertEquals(sanitizeInstanceName("%72ecent") === sanitizeInstanceName("recent"), false);
+  assertEquals(
+    sanitizeInstanceName("%72ecent") === sanitizeInstanceName("recent"),
+    false,
+  );
 });
 
 Deno.test("instance name: never returns empty", () => {
@@ -594,7 +664,8 @@ Deno.test("recent: kind filters the list but not the root-cause lookup", () => {
 
 Deno.test("recent: a workflow whose step model left no error still names the step", () => {
   // An assert or expression step records no model error. The step name is
-  // still the most useful thing to report, and the category is honestly none.
+  // still the most useful thing to report -- and the run did fail, so the
+  // category is `unrecorded`, never `none`.
   const f = describeFailure(
     head("nightly", "workflow", "2026-08-04T17:00:00Z", {
       status: "failed",
@@ -604,7 +675,32 @@ Deno.test("recent: a workflow whose step model left no error still names the ste
   );
   assertEquals(f.failingMethod, "gate → check");
   assertEquals(f.rootCauseModel, null);
-  assertEquals(f.category, "none");
+  assertEquals(f.category, "unrecorded");
+});
+
+Deno.test("recent: a step model whose latest run succeeded does not read as none", () => {
+  // The hop reads the step model's LATEST summary. When that model has run
+  // successfully since, it carries no error -- and the workflow still failed.
+  const f = describeFailure(
+    head("notify-chain", "workflow", "2026-08-04T17:00:00Z", {
+      status: "failed",
+      failures: [{ modelName: "apprise", methodName: "notify" }],
+    }),
+    new Map([["apprise", { status: "succeeded" }]]),
+  );
+  assertEquals(f.status, "failed");
+  assertEquals(f.failingMethod, "apprise → notify");
+  assertEquals(f.rootCauseModel, null);
+  assertEquals(f.category, "unrecorded");
+  assertEquals(f.error, null);
+});
+
+Deno.test("recent: a failed model summary with no error is unrecorded", () => {
+  const f = describeFailure(
+    head("x", "model", "2026-08-04T17:00:00Z", { status: "failed" }),
+    new Map(),
+  );
+  assertEquals(f.category, "unrecorded");
 });
 
 Deno.test("recent: errors are redacted after classification", () => {
@@ -622,7 +718,10 @@ Deno.test("recent: errors are redacted after classification", () => {
 
 Deno.test("recent: nothing failing says so plainly", () => {
   const sel = selectRecentFailures([], NOW, 24, "auto", 20);
-  assertEquals(buildRecentSummary(sel, 24), "Nothing has failed in the last 24h.");
+  assertEquals(
+    buildRecentSummary(sel, 24),
+    "Nothing has failed in the last 24h.",
+  );
 });
 
 /** A fake data repository keyed by `${type}|${id}|${name}|${version}`. */
@@ -654,7 +753,9 @@ function fakeContext(
         findByName: (t: string, i: string, n: string, v?: number) => {
           const r = byKey.get(key(t, i, n, v));
           return Promise.resolve(
-            r?.createdAt ? { version: r.version, createdAt: r.createdAt } : null,
+            r?.createdAt
+              ? { version: r.version, createdAt: r.createdAt }
+              : null,
           );
         },
         getContent: (t: string, i: string, n: string, v?: number) => {
@@ -773,4 +874,82 @@ Deno.test("recent: each failure carries its model type", () => {
   const text = buildRecentSummary(sel, 24);
   assertEquals(text.includes("docker-ssh (model @acme/ssh/host)"), true);
   assertEquals(text.includes("nightly (workflow)"), true);
+});
+
+/* --------------------------- investigate --------------------------- */
+
+Deno.test("investigate: a failed workflow whose step model has since succeeded is unrecorded", async () => {
+  // The same hop as `recent`, made by `investigate`: it reads the step
+  // model's latest summary, which carries no error once that model has
+  // succeeded again. The finding must still say the workflow is failing.
+  const dir = await Deno.makeTempDir();
+  try {
+    await Deno.mkdir(`${dir}/models`, { recursive: true });
+    await Deno.mkdir(`${dir}/workflows`, { recursive: true });
+    await Deno.writeTextFile(
+      `${dir}/models/apprise.yaml`,
+      "type: '@acme/apprise'\nid: m-1\nname: apprise\n",
+    );
+    await Deno.writeTextFile(
+      `${dir}/workflows/notify-chain.yaml`,
+      "id: w-1\nname: notify-chain\n",
+    );
+    const bodies: Record<string, Record<number, Record<string, unknown>>> = {
+      "workflow/w-1": {
+        1: {
+          status: "failed",
+          failures: [{ modelName: "apprise", methodName: "notify" }],
+        },
+      },
+      "@acme/apprise/m-1": { 1: { status: "succeeded", methodName: "notify" } },
+    };
+    const latestOf = (k: string) =>
+      Math.max(...Object.keys(bodies[k]).map(Number));
+    const written: {
+      spec: string;
+      instance: string;
+      data: Record<string, unknown>;
+    }[] = [];
+    const enc = new TextEncoder();
+    const context = {
+      repoDir: dir,
+      globalArgs: {},
+      writeResource: (spec: string, instance: string, data: unknown) => {
+        written.push({ spec, instance, data: data as Record<string, unknown> });
+        return Promise.resolve({ spec, instance });
+      },
+      dataRepository: {
+        findByName: (type: string, id: string, _n: string, v?: number) => {
+          const k = `${type}/${id}`;
+          if (!bodies[k]) return Promise.resolve(null);
+          const version = v ?? latestOf(k);
+          return Promise.resolve(
+            bodies[k][version]
+              ? { version, createdAt: "2026-08-04T17:00:00Z" }
+              : null,
+          );
+        },
+        getContent: (type: string, id: string, _n: string, v?: number) => {
+          const k = `${type}/${id}`;
+          const b = bodies[k]?.[v ?? (bodies[k] ? latestOf(k) : 0)];
+          return Promise.resolve(b ? enc.encode(JSON.stringify(b)) : null);
+        },
+      },
+      logger: { info: () => {}, warning: () => {} },
+    };
+    await model.methods.investigate.execute(
+      { target: "notify-chain", kind: "auto", maxVersions: 60 },
+      context,
+    );
+    const finding = written.find((w) => w.instance === "current")!.data;
+    assertEquals(finding.failing, true);
+    assertEquals(finding.failingMethod, "apprise → notify");
+    assertEquals(finding.category, "unrecorded");
+    assertEquals(
+      String(finding.summary).includes("Nothing to investigate"),
+      false,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });

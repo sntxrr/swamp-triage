@@ -5,6 +5,7 @@ import {
   describeFailure,
   METHOD_SUMMARY,
   model,
+  readRecoveredFailures,
   readSummaryHeads,
   readTopLevelScalars,
   reconstructTimeline,
@@ -874,6 +875,205 @@ Deno.test("recent: each failure carries its model type", () => {
   const text = buildRecentSummary(sel, 24);
   assertEquals(text.includes("docker-ssh (model @acme/ssh/host)"), true);
   assertEquals(text.includes("nightly (workflow)"), true);
+});
+
+/** One target's summary history, newest version last, as stored records. */
+function history(
+  modelId: string,
+  target: string,
+  runs: [createdAt: string, status: string, error?: string][],
+  modelType = "@acme/ssh/host",
+) {
+  return runs.map(([createdAt, status, error], i) => ({
+    name: METHOD_SUMMARY,
+    version: i + 1,
+    modelId,
+    modelType,
+    tags: { modelName: target },
+    createdAt,
+    content: JSON.stringify({ status, methodName: "exec", error }),
+  }));
+}
+
+/** Only each target's latest version, as `queryData` returns them. */
+const latestOnly = <T extends { modelId: string; version: number }>(
+  records: T[],
+) =>
+  records.filter((r) =>
+    !records.some((o) => o.modelId === r.modelId && o.version > r.version)
+  );
+
+async function recentOf(
+  records: ReturnType<typeof history>,
+  withinHours: number,
+  maxVersions = 60,
+  limit = 20,
+) {
+  const { context } = fakeContext(records);
+  const heads = (await readSummaryHeads({
+    ...context,
+    queryData: () => Promise.resolve(latestOnly(records)),
+  })).heads;
+  const { recovered, truncated } = await readRecoveredFailures(
+    context,
+    heads,
+    NOW,
+    withinHours,
+    "auto",
+    maxVersions,
+  );
+  return {
+    sel: selectRecentFailures(
+      heads,
+      NOW,
+      withinHours,
+      "auto",
+      limit,
+      recovered,
+    ),
+    truncated,
+  };
+}
+
+Deno.test("recent: a target that failed in the window and recovered is listed", async () => {
+  // The daily-summary case: run history names a type whose failing instance
+  // has already succeeded again. A head-only read listed nothing, so the
+  // instance could not be named.
+  const { sel } = await recentOf(
+    history("m-1", "edge-ssh", [
+      ["2026-08-04T09:00:00Z", "succeeded"],
+      ["2026-08-04T10:00:00Z", "failed", "connect ECONNREFUSED 192.0.2.7:22"],
+      ["2026-08-04T11:00:00Z", "failed", "connect ECONNREFUSED 192.0.2.7:22"],
+      ["2026-08-04T12:00:00Z", "succeeded"],
+      ["2026-08-04T13:00:00Z", "succeeded"],
+    ]),
+    24,
+  );
+  assertEquals(sel.failures.length, 1);
+  const f = sel.failures[0];
+  assertEquals(f.target, "edge-ssh");
+  assertEquals(f.targetType, "@acme/ssh/host");
+  assertEquals(f.failing, false);
+  assertEquals(f.failedAt, "2026-08-04T11:00:00.000Z");
+  // The first success after the newest failure, not the latest success.
+  assertEquals(f.recoveredAt, "2026-08-04T12:00:00.000Z");
+  assertEquals(f.failureCount, 2);
+  assertEquals(f.category, "unreachable");
+  assertEquals(
+    buildRecentSummary(sel, 24).includes(
+      "edge-ssh (model @acme/ssh/host) at `exec` — **unreachable** — " +
+        "failed 2x, last at 2026-08-04T11:00:00.000Z, recovered at " +
+        "2026-08-04T12:00:00.000Z",
+    ),
+    true,
+  );
+});
+
+Deno.test("recent: a failure that recovered before the window is not listed", async () => {
+  const { sel, truncated } = await recentOf(
+    history("m-1", "edge-ssh", [
+      ["2026-08-02T10:00:00Z", "failed"],
+      ["2026-08-02T11:00:00Z", "succeeded"],
+      ["2026-08-04T12:00:00Z", "succeeded"],
+    ]),
+    24,
+  );
+  assertEquals(sel.failures.length, 0);
+  assertEquals(truncated, 0);
+});
+
+Deno.test("recent: still-failing targets sort ahead of recovered ones", async () => {
+  const { sel } = await recentOf(
+    [
+      // Recovered, with the newest failure of all -- still listed second.
+      ...history("m-1", "edge-ssh", [
+        ["2026-08-04T17:00:00Z", "failed"],
+        ["2026-08-04T17:30:00Z", "succeeded"],
+      ]),
+      ...history("m-2", "store-ssh", [
+        ["2026-08-04T09:00:00Z", "succeeded"],
+        ["2026-08-04T10:00:00Z", "failed", "401 Unauthorized"],
+      ]),
+    ],
+    24,
+  );
+  assertEquals(
+    sel.failures.map((f) => [f.target, f.failing]),
+    [["store-ssh", true], ["edge-ssh", false]],
+  );
+  assertEquals(sel.failures[0].recoveredAt, null);
+  assertEquals(sel.failures[0].failureCount, null);
+  assertEquals(
+    buildRecentSummary(sel, 24).includes("still failing listed before"),
+    true,
+  );
+});
+
+Deno.test("recent: limit counts recovered targets, cutting them before failing ones", async () => {
+  const { sel } = await recentOf(
+    [
+      ...history("m-1", "a", [
+        ["2026-08-04T10:00:00Z", "failed"],
+        ["2026-08-04T11:00:00Z", "succeeded"],
+      ]),
+      ...history("m-2", "b", [["2026-08-04T09:00:00Z", "failed"]]),
+    ],
+    24,
+    60,
+    1,
+  );
+  assertEquals(sel.failures.map((f) => f.target), ["b"]);
+  assertEquals(sel.omitted, 1);
+});
+
+Deno.test("recent: a walk that runs out of versions inside the window says so", async () => {
+  const runs: [string, string][] = [["2026-08-04T10:00:00Z", "failed"]];
+  for (let i = 0; i < 5; i++) {
+    runs.push([`2026-08-04T1${i + 1}:00:00Z`, "succeeded"]);
+  }
+  const all = history("m-1", "busy", runs);
+  // Two versions back reaches neither the failure nor the window start.
+  const short = await recentOf(all, 24, 2);
+  assertEquals(short.sel.failures.length, 0);
+  assertEquals(short.truncated, 1);
+  const full = await recentOf(all, 24, 60);
+  assertEquals(full.sel.failures.map((f) => f.target), ["busy"]);
+  assertEquals(full.truncated, 0);
+});
+
+Deno.test("recent: the recorded resource matches its schema, recovered entries included", async () => {
+  const now = Date.now();
+  const at = (hoursAgo: number) =>
+    new Date(now - hoursAgo * 3_600_000).toISOString();
+  const records = [
+    ...history("m-1", "edge-ssh", [
+      [at(3), "failed", "401 Unauthorized"],
+      [at(2), "succeeded"],
+    ]),
+    ...history("m-2", "store-ssh", [[at(1), "failed"]]),
+  ];
+  const { context } = fakeContext(records);
+  const written: unknown[] = [];
+  await model.methods.recent.execute(
+    { withinHours: 24, kind: "auto", limit: 20, maxVersions: 60 },
+    {
+      ...context,
+      queryData: () => Promise.resolve(latestOnly(records)),
+      repoDir: ".",
+      globalArgs: {},
+      writeResource: (_s: string, _i: string, data: unknown) => {
+        written.push(data);
+        return Promise.resolve({});
+      },
+      logger: { info: () => {}, warning: () => {} },
+    },
+  );
+  const rec = model.resources.recent.schema.parse(written[0]);
+  assertEquals(
+    rec.failures.map((f) => [f.target, f.failing, f.failureCount]),
+    [["store-ssh", true, null], ["edge-ssh", false, 1]],
+  );
+  assertEquals(rec.historyTruncated, 0);
 });
 
 /* --------------------------- investigate --------------------------- */

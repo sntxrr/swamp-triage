@@ -70,13 +70,28 @@ swamp model @sntxrr/swamp-triage/investigation method run recent <name> \
 | `withinHours` | `24`    | How far back to look for failed runs (1–720)             |
 | `kind`        | `auto`  | `auto`, `model`, or `workflow`                           |
 | `limit`       | `20`    | Maximum failures to list; the rest are counted, not lost |
+| `maxVersions` | `60`    | Earlier runs read per recovered target (1–500)           |
 
 `investigate` needs a name, and an alert does not always carry one: a relayed
 notification can arrive with no body, and "what just broke?" has no name in it.
-`recent` answers that question first. It lists every model and workflow whose
-**most recent** run failed within the window, newest first, each with its
-failing step, category and redacted error. Then `investigate` the one that
-matters for its full timeline.
+`recent` answers that question first. It lists every model and workflow that
+failed within the window, each with its failing step, category and redacted
+error. Then `investigate` the one that matters for its full timeline.
+
+Targets still failing come first, then those that failed and have since
+recovered; each group is newest first. A recovered entry has `failing: false`,
+`recoveredAt` (the first success after its newest failure) and `failureCount`
+(failed runs in the window); a still-failing one has `failing: true` and nulls
+for both. Recovered targets matter because run history and daily summaries
+report what failed in a period, not what is failing now, and by the time
+anyone reads them the instance has often succeeded again. Only listing the
+latest run would leave that line with no instance to name.
+
+Finding a recovered target means walking its summary versions back to the
+start of the window, as `investigate` does. `maxVersions` bounds that walk; a
+target with more runs than that inside the window is counted in
+`historyTruncated`, so an unseen failure is reported as unseen rather than
+absent.
 
 Each failure carries its `target` (instance or workflow name) **and**
 `targetType` (the model type, or `workflow`). Run history and many alerts name

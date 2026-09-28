@@ -634,9 +634,29 @@ export interface SummaryHead {
   createdAt: string;
   /** The parsed report body. */
   body: Record<string, unknown>;
+  /** Where the report lives, so older versions can be walked. */
+  modelId?: string;
+  dataName?: string;
+  version?: number;
 }
 
-/** One target whose most recent run failed. */
+/**
+ * A target that failed inside the window and has succeeded since.
+ *
+ * Its latest summary is a success, so a head-only read cannot see it -- yet
+ * "what failed overnight?" is exactly the question a daily summary asks, and
+ * the answer has to name the instance even when it has already recovered.
+ */
+export interface RecoveredFailure {
+  /** The newest failed run inside the window, shaped as a head. */
+  failed: SummaryHead;
+  /** When the first success after that failure was recorded. */
+  recoveredAt: string;
+  /** Failed runs inside the window. */
+  failureCount: number;
+}
+
+/** One target that failed within the window. */
 export interface RecentFailure {
   target: string;
   kind: string;
@@ -656,12 +676,23 @@ export interface RecentFailure {
   error: string | null;
   redactions: number;
   redactedKinds: string[];
+  /** True when the target's latest run failed; false when it has recovered. */
+  failing: boolean;
+  /** When a recovered target next succeeded; null while still failing. */
+  recoveredAt: string | null;
+  /**
+   * Failed runs inside the window for a recovered target. Null for one still
+   * failing: its latest run is all that is read, and `investigate` counts the
+   * streak.
+   */
+  failureCount: number | null;
 }
 
 /** What `recent` found, before it is recorded. */
 export interface RecentSelection {
+  /** Still-failing targets first, then recovered ones; newest first in each. */
   failures: RecentFailure[];
-  /** Failing targets inside the window beyond `limit`. */
+  /** Targets that failed inside the window beyond `limit`. */
   omitted: number;
   /**
    * Targets still failing whose last run is older than the window -- a
@@ -729,21 +760,26 @@ export function describeFailure(
     error: error === null ? null : r.text,
     redactions: r.count,
     redactedKinds: r.kinds,
+    failing: true,
+    recoveredAt: null,
+    failureCount: null,
   };
 }
 
 /**
- * Pick the targets whose most recent run failed within the window.
+ * Pick the targets that failed within the window.
  *
  * Anything not an explicit success counts as a failure, as in
- * `reconstructTimeline`. Results are newest first, so the thing that broke
- * most recently -- usually the one an alert is about -- leads.
+ * `reconstructTimeline`. Targets still failing come first, then those that
+ * failed and have since recovered; each group is newest first, so the thing
+ * that broke most recently -- usually the one an alert is about -- leads.
  *
  * @param heads Latest summary per target, any order.
  * @param nowMs Reference time in epoch milliseconds.
  * @param withinHours Window size.
  * @param kind "model", "workflow", or "auto" for both.
  * @param limit Maximum failures to return.
+ * @param recovered Targets found by `readRecoveredFailures`.
  */
 export function selectRecentFailures(
   heads: SummaryHead[],
@@ -751,6 +787,7 @@ export function selectRecentFailures(
   withinHours: number,
   kind: string,
   limit: number,
+  recovered: RecoveredFailure[] = [],
 ): RecentSelection {
   const since = nowMs - withinHours * 3_600_000;
   const methodBodies = new Map<string, Record<string, unknown>>();
@@ -779,13 +816,107 @@ export function selectRecentFailures(
   };
   inWindow.sort((a, b) => when(b) - when(a));
 
+  const back = recovered
+    .filter((r) => kind === "auto" || r.failed.kind === kind)
+    .sort((a, b) => when(b.failed) - when(a.failed));
+
+  const all: RecentFailure[] = [
+    ...inWindow.map((h) => describeFailure(h, methodBodies)),
+    ...back.map((r) => ({
+      ...describeFailure(r.failed, methodBodies),
+      failing: false,
+      recoveredAt: r.recoveredAt,
+      failureCount: r.failureCount,
+    })),
+  ];
   return {
-    failures: inWindow.slice(0, limit).map((h) =>
-      describeFailure(h, methodBodies)
-    ),
-    omitted: Math.max(0, inWindow.length - limit),
+    failures: all.slice(0, limit),
+    omitted: Math.max(0, all.length - limit),
     staleFailing,
   };
+}
+
+/**
+ * Find targets whose latest run succeeded but which failed inside the window.
+ *
+ * For each such target, walk its summary versions newest-first -- the same
+ * walk `investigate` makes, where every version is one recorded run -- and
+ * stop at the first version older than the window.
+ *
+ * @param heads Latest summary per target, as `readSummaryHeads` returns them.
+ * @param maxVersions Most versions to read per target.
+ * @returns The recovered targets, and how many walks hit `maxVersions`
+ *   before leaving the window -- a failure beyond that is not seen.
+ */
+export async function readRecoveredFailures(
+  context: Pick<Context, "dataRepository">,
+  heads: SummaryHead[],
+  nowMs: number,
+  withinHours: number,
+  kind: string,
+  maxVersions: number,
+): Promise<{ recovered: RecoveredFailure[]; truncated: number }> {
+  const since = nowMs - withinHours * 3_600_000;
+  const decoder = new TextDecoder();
+  const recovered: RecoveredFailure[] = [];
+  let truncated = 0;
+
+  for (const h of heads) {
+    if (kind !== "auto" && h.kind !== kind) continue;
+    if (h.body.status !== "succeeded") continue;
+    if (!h.modelId || !h.dataName || h.version === undefined) continue;
+    // A head older than the window means every earlier run is older still.
+    const headAt = Date.parse(h.createdAt);
+    if (!isNaN(headAt) && headAt < since) continue;
+
+    let newerAt = h.createdAt;
+    let failed: SummaryHead | null = null;
+    let recoveredAt = "";
+    let failureCount = 0;
+    let leftWindow = false;
+    const floor = Math.max(1, h.version - maxVersions);
+    for (let v = h.version - 1; v >= floor; v--) {
+      const meta = await context.dataRepository.findByName(
+        h.type,
+        h.modelId,
+        h.dataName,
+        v,
+      );
+      const bytes = await context.dataRepository.getContent(
+        h.type,
+        h.modelId,
+        h.dataName,
+        v,
+      );
+      if (!meta || !bytes) continue; // Garbage-collected mid-range.
+      const at = isoTime(meta.createdAt);
+      const t = Date.parse(at);
+      if (!isNaN(t) && t < since) {
+        leftWindow = true;
+        break;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(decoder.decode(bytes));
+      } catch {
+        continue; // A corrupt version must not abort the walk.
+      }
+      if (body.status === "succeeded") {
+        // Only successes newer than the newest failure mark the recovery.
+        if (!failed) newerAt = at;
+        continue;
+      }
+      failureCount++;
+      if (!failed) {
+        failed = { ...h, createdAt: at, body, version: v };
+        recoveredAt = newerAt;
+      }
+    }
+    // Reaching version 1 is the whole history, not a truncated walk.
+    if (!leftWindow && floor > 1) truncated++;
+    if (failed) recovered.push({ failed, recoveredAt, failureCount });
+  }
+  return { recovered, truncated };
 }
 
 /** Render a `recent` result as a paragraph for a notification or chat. */
@@ -797,17 +928,23 @@ export function buildRecentSummary(
   if (sel.failures.length === 0) {
     lines.push(`Nothing has failed in the last ${withinHours}h.`);
   } else {
+    const back = sel.failures.filter((f) => !f.failing).length;
     lines.push(
       `${sel.failures.length + sel.omitted} target(s) failed in the last ` +
-        `${withinHours}h, newest first:`,
+        `${withinHours}h, newest first` +
+        (back > 0 ? `; still failing listed before recovered:` : ":"),
     );
     for (const f of sel.failures) {
       const where = f.failingMethod ? ` at \`${f.failingMethod}\`` : "";
       // A model's type is what a run-history line names; show it so the two
       // can be matched by eye.
       const what = f.kind === "model" ? `model ${f.targetType}` : f.kind;
+      const state = f.failing
+        ? `, ${f.failedAt}`
+        : ` — failed ${f.failureCount}x, last at ${f.failedAt}, recovered ` +
+          `at ${f.recoveredAt}`;
       lines.push(
-        `- ${f.target} (${what})${where} — **${f.category}**, ${f.failedAt}`,
+        `- ${f.target} (${what})${where} — **${f.category}**${state}`,
       );
     }
     if (sel.omitted > 0) {
@@ -884,11 +1021,21 @@ const RecentSchema = z.object({
     error: z.string().nullable(),
     redactions: z.number(),
     redactedKinds: z.array(z.string()),
+    /** False when the target failed in the window and has since recovered. */
+    failing: z.boolean(),
+    recoveredAt: z.string().nullable(),
+    /** Failed runs in the window, for a recovered target; else null. */
+    failureCount: z.number().nullable(),
   })),
-  /** Failing targets inside the window left out by `limit`. */
+  /** Targets that failed inside the window left out by `limit`. */
   omitted: z.number(),
   /** Targets still failing whose last run predates the window. */
   staleFailing: z.number(),
+  /**
+   * Recovered targets whose history walk hit `maxVersions` inside the window;
+   * an older failure of theirs was not seen. Raise `maxVersions` to see it.
+   */
+  historyTruncated: z.number(),
   /** Plain-language list, suitable for a notification body. */
   summary: z.string(),
 });
@@ -1018,6 +1165,9 @@ export async function readSummaryHeads(
       type: rec.modelType,
       createdAt: isoTime(meta.createdAt),
       body,
+      modelId: rec.modelId,
+      dataName: rec.name,
+      version: rec.version,
     });
   }
   return { heads, skipped };
@@ -1114,7 +1264,7 @@ function buildSummary(
 
 export const model = {
   type: "@sntxrr/swamp-triage/investigation",
-  version: "2026.09.26.1",
+  version: "2026.09.28.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1134,6 +1284,12 @@ export const model = {
         "with no error text as `unrecorded`; global arguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.09.28.1",
+      description: "`recent` also lists targets that failed in the window " +
+        "and have since recovered; global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     investigation: {
@@ -1144,8 +1300,8 @@ export const model = {
       garbageCollection: 20,
     },
     recent: {
-      description:
-        "Every model and workflow whose most recent run failed within a window.",
+      description: "Every model and workflow that failed within a window, " +
+        "whether still failing or since recovered.",
       schema: RecentSchema,
       lifetime: "infinite" as const,
       garbageCollection: 20,
@@ -1409,10 +1565,12 @@ export const model = {
     },
     recent: {
       description:
-        "List every model and workflow whose most recent run failed within " +
-        "the last `withinHours`, newest first, each with its failing step and " +
-        "error category. Needs no target name -- use it when an alert names " +
-        "nothing, then `investigate` the one that matters. Read-only.",
+        "List every model and workflow that failed within the last " +
+        "`withinHours` -- still failing first, then those that have since " +
+        "recovered (failing=false, with recoveredAt) -- newest first, each " +
+        "with its instance name, failing step and error category. Needs no " +
+        "target name -- use it when an alert names nothing, then " +
+        "`investigate` the one that matters. Read-only.",
       arguments: z.object({
         withinHours: z.number().int().min(1).max(720).default(24).describe(
           "How far back to look for failed runs.",
@@ -1423,9 +1581,18 @@ export const model = {
         limit: z.number().int().min(1).max(100).default(20).describe(
           "Maximum failures to list; the rest are counted, not dropped.",
         ),
+        maxVersions: z.number().int().min(1).max(500).default(60).describe(
+          "How many earlier runs to read per recovered target when looking " +
+            "for a failure inside the window.",
+        ),
       }),
       execute: async (
-        args: { withinHours: number; kind: string; limit: number },
+        args: {
+          withinHours: number;
+          kind: string;
+          limit: number;
+          maxVersions: number;
+        },
         context: Context,
       ) => {
         const now = Date.now();
@@ -1441,12 +1608,28 @@ export const model = {
           );
         }
 
+        const { recovered, truncated } = await readRecoveredFailures(
+          context,
+          heads,
+          now,
+          args.withinHours,
+          args.kind,
+          args.maxVersions,
+        );
+        if (truncated > 0) {
+          context.logger.warning(
+            "{count} recovered target(s) have more than {max} runs in the " +
+              "window; older failures of theirs were not read",
+            { count: truncated, max: args.maxVersions },
+          );
+        }
         const sel = selectRecentFailures(
           heads,
           now,
           args.withinHours,
           args.kind,
           args.limit,
+          recovered,
         );
         const redactions = sel.failures.reduce((n, f) => n + f.redactions, 0);
         if (redactions > 0) {
@@ -1478,6 +1661,7 @@ export const model = {
           failures: sel.failures,
           omitted: sel.omitted,
           staleFailing: sel.staleFailing,
+          historyTruncated: truncated,
           summary: buildRecentSummary(sel, args.withinHours),
         });
         return { dataHandles: [handle] };

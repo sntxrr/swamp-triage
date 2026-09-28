@@ -15,7 +15,7 @@ automates.
 | Method        | Writes? | What it does                                                     |
 | ------------- | ------- | ---------------------------------------------------------------- |
 | `investigate` | no      | Resolve a target by name, reconstruct when it broke, classify it |
-| `recent`      | no      | List everything whose latest run failed in a window, no name needed |
+| `recent`      | no      | List everything that failed in a window, even if since recovered |
 
 Every method and workflow run already leaves a `@swamp/method-summary` or
 `@swamp/workflow-summary` report behind as versioned model data, written on

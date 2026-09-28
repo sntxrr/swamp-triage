@@ -1041,6 +1041,24 @@ Deno.test("recent: a walk that runs out of versions inside the window says so", 
   assertEquals(full.truncated, 0);
 });
 
+Deno.test("recent: a walk that leaves the window before maxVersions is not truncated", async () => {
+  // Older versions exist beyond the cap, but the walk has already passed the
+  // window start -- nothing in the window went unread.
+  const { sel, truncated } = await recentOf(
+    history("m-1", "busy", [
+      ["2026-08-01T10:00:00Z", "failed"],
+      ["2026-08-01T11:00:00Z", "succeeded"],
+      ["2026-08-01T12:00:00Z", "succeeded"],
+      ["2026-08-04T10:00:00Z", "succeeded"],
+      ["2026-08-04T11:00:00Z", "succeeded"],
+    ]),
+    24,
+    2,
+  );
+  assertEquals(sel.failures.length, 0);
+  assertEquals(truncated, 0);
+});
+
 Deno.test("recent: the recorded resource matches its schema, recovered entries included", async () => {
   const now = Date.now();
   const at = (hoursAgo: number) =>

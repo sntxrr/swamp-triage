@@ -138,10 +138,13 @@ than returning an empty list when it does not.
 
 Three flags separate what the fleet did from what the caller did:
 
-- **`selfInflicted`** marks a failed run of this investigator's own type, such
-  as a bad name or argument from whoever ran triage. These are listed after
-  every other failure and summarised in one line as caller errors, so an agent
-  re-reading its own mistakes does not report them as an outage.
+- **`selfInflicted`** marks a failed run of this investigator that its caller
+  caused: a rejected argument (`caller_args`), a name that matches nothing, or
+  the older refusal for a target with no runs. These are listed after every
+  other failure and summarised in one line, so an agent re-reading its own
+  mistakes does not report them as an outage. Any other failure of the
+  investigator, such as a lock timeout or a crash after an upgrade, is not
+  flagged: it means triage itself is broken.
 - **`quickRetry`** marks a recovered failure whose next run, of the same method,
   succeeded within 60 seconds. A remote that heals on its own does not do so on
   the very next call; a caller retrying with a corrected value does.

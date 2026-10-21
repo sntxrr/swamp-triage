@@ -857,8 +857,9 @@ export interface RecentFailure {
    */
   failureCount: number | null;
   /**
-   * The failure is one of this investigator's own runs -- a bad name or
-   * argument from whoever ran triage. A caller error, not a fleet failure.
+   * The failure is one of this investigator's own runs, failed by its
+   * caller's input -- a bad name or argument. A caller error, not a fleet
+   * failure. Any other failure of the investigator is not flagged.
    */
   selfInflicted: boolean;
   /**
@@ -975,6 +976,25 @@ export function isQuickRetry(r: RecoveredFailure): boolean {
   return sameMethod && backAt - failedAt <= QUICK_RETRY_SECONDS * 1000;
 }
 
+/**
+ * Errors the investigator raises about its caller's input: a rejected
+ * argument, a name that matches nothing, and the pre-2026.10.21 refusal for a
+ * target with no runs. Only these make a failure of the investigator itself a
+ * caller error. Anything else -- a lock timeout, a crash after an upgrade --
+ * means the investigator is broken, and must be listed like any other failure
+ * rather than filed away where nobody looks.
+ */
+const CALLER_ERROR_PATTERNS = [
+  /^No (model or workflow|model|workflow) named "/,
+  /^No summary reports recorded for /,
+];
+
+/** Whether an investigator failure was caused by its caller's input. */
+export function isCallerError(f: Pick<RecentFailure, "category" | "error">) {
+  return f.category === "caller_args" ||
+    CALLER_ERROR_PATTERNS.some((p) => p.test(f.error ?? ""));
+}
+
 /** What `selectRecentFailures` needs beyond the window itself. */
 export interface RecentOptions {
   /** The investigator's own model type; its failures are caller errors. */
@@ -1049,7 +1069,7 @@ export function selectRecentFailures(
   const mark = (f: RecentFailure): RecentFailure => ({
     ...f,
     selfInflicted: opts.selfType !== undefined &&
-      f.targetType === opts.selfType,
+      f.targetType === opts.selfType && isCallerError(f),
     definitionPath: pathOf(f.target, f.kind),
   });
 

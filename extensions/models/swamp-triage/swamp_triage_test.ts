@@ -3,6 +3,7 @@ import {
   buildRecentSummary,
   classifyError,
   describeFailure,
+  isCallerError,
   isQuickRetry,
   listDefinitions,
   MAX_WINDOW_HOURS,
@@ -1296,6 +1297,7 @@ Deno.test("recent: only the investigator failing reads as nothing in the fleet",
     [head("triage", "model", "2026-08-04T17:30:00Z", {
       status: "failed",
       methodName: "recent",
+      error: "Method arguments validation failed: Too big",
     }, MODEL_TYPE)],
     NOW,
     24,
@@ -1631,4 +1633,51 @@ Deno.test("recent: an over-wide window is capped with a warning, not refused", a
 
 Deno.test("model: MODEL_TYPE is the model's own type", () => {
   assertEquals(model.type, MODEL_TYPE);
+});
+
+Deno.test("recent: the investigator breaking for real is not filed as a caller error", () => {
+  // Only input mistakes are the caller's. A lock timeout or a crash after an
+  // upgrade means triage itself is broken, and must read like any failure.
+  const sel = selectRecentFailures(
+    [
+      head("triage", "model", "2026-08-04T17:30:00Z", {
+        status: "failed",
+        methodName: "recent",
+        error: 'Lock "triage" held by another process: timed out',
+      }, MODEL_TYPE),
+      head("triage-b", "model", "2026-08-04T17:20:00Z", {
+        status: "failed",
+        methodName: "recent",
+        error: "Method arguments validation failed: Too big",
+      }, MODEL_TYPE),
+    ],
+    NOW,
+    24,
+    "auto",
+    20,
+    [],
+    { selfType: MODEL_TYPE },
+  );
+  assertEquals(sel.failures.map((f) => [f.target, f.selfInflicted]), [
+    ["triage", false],
+    ["triage-b", true],
+  ]);
+  assertEquals(
+    buildRecentSummary(sel, 24).includes("1 target(s) failed"),
+    true,
+  );
+});
+
+Deno.test("caller error: names, arguments and the old no-runs refusal only", () => {
+  const e = (error: string) => isCallerError(classified(error));
+  assertEquals(e('No model or workflow named "x" found in /repo.'), true);
+  assertEquals(e('No summary reports recorded for workflow "x".'), true);
+  assertEquals(e("Method arguments validation failed: bad"), true);
+  assertEquals(e("TypeError: cannot read properties of undefined"), false);
+  assertEquals(e("connect ECONNREFUSED 192.0.2.1:443"), false);
+});
+
+const classified = (error: string) => ({
+  error,
+  category: classifyError(error, true).category,
 });

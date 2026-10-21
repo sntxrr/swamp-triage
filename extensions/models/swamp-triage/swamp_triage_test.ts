@@ -3,8 +3,16 @@ import {
   buildRecentSummary,
   classifyError,
   describeFailure,
+  isQuickRetry,
+  listDefinitions,
+  MAX_WINDOW_HOURS,
   METHOD_SUMMARY,
   model,
+  MODEL_TYPE,
+  parsePlacement,
+  placedHere,
+  rankNames,
+  readNestedScalars,
   readRecoveredFailures,
   readSummaryHeads,
   readTopLevelScalars,
@@ -1170,4 +1178,457 @@ Deno.test("investigate: a failed workflow whose step model has since succeeded i
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
+});
+
+/* ------------------ caller errors and never-run ------------------- */
+
+Deno.test("classify: a rejected call argument is caller_args, not config", () => {
+  // Swamp's wording when a call's arguments fail the method schema. The
+  // definition holds no method arguments, so "go to the YAML" is wrong here.
+  const c = classifyError(
+    "Method arguments validation failed: Too big: expected number to be " +
+      '<=720 at "withinHours"',
+  );
+  assertEquals(c.category, "caller_args");
+  assertEquals(c.matched, true);
+});
+
+Deno.test("classify: other validation failures stay config", () => {
+  assertEquals(classifyError("schema validation failed").category, "config");
+});
+
+Deno.test("nested scalars: reads a mapping's children and stops at the next key", () => {
+  const text = [
+    "id: w-1",
+    "name: archive-nightly-dump",
+    "description: >-",
+    "  schedule: not-this-one",
+    "tags:",
+    "  runs-on: scheduler-a",
+    "  kind: backup",
+    "  nested:",
+    "    deep: ignored",
+    "trigger:",
+    "  # monthly",
+    '  schedule: "0 8 3 * *"',
+    "jobs:",
+    "  schedule: not-a-trigger",
+  ].join("\n");
+  assertEquals(readNestedScalars(text, "trigger"), { schedule: "0 8 3 * *" });
+  assertEquals(readNestedScalars(text, "tags"), {
+    "runs-on": "scheduler-a",
+    kind: "backup",
+  });
+  assertEquals(readNestedScalars(text, "absent"), {});
+});
+
+Deno.test("rank names: a near-miss guess puts the intended name first", () => {
+  const near = rankNames("nightly-dump", [
+    { name: "archive-nightly-dump", kind: "workflow" },
+    { name: "archive-photos", kind: "workflow" },
+    { name: "widget", kind: "model" },
+  ]);
+  assertEquals(near[0].name, "archive-nightly-dump");
+  // A candidate sharing no word with the guess is never suggested.
+  assertEquals(near.some((n) => n.name === "widget"), false);
+});
+
+Deno.test("rank names: nothing in common suggests nothing", () => {
+  assertEquals(rankNames("zzz", [{ name: "widget", kind: "model" }]), []);
+});
+
+Deno.test("placement: parses key=value, refuses anything else", () => {
+  assertEquals(parsePlacement("runs-on=scheduler-a"), {
+    key: "runs-on",
+    value: "scheduler-a",
+  });
+  assertEquals(parsePlacement(undefined), null);
+  assertEquals(parsePlacement("  "), null);
+  let message = "";
+  try {
+    parsePlacement("scheduler-a");
+  } catch (err) {
+    message = (err as Error).message;
+  }
+  assertEquals(message.includes("key=value"), true);
+  assertEquals(
+    placedHere({ "runs-on": "a" }, { key: "runs-on", value: "a" }),
+    true,
+  );
+  assertEquals(
+    placedHere({ "runs-on": "b" }, { key: "runs-on", value: "a" }),
+    false,
+  );
+  assertEquals(placedHere({}, null), true);
+});
+
+Deno.test("recent: the investigator's own failures are flagged and listed last", () => {
+  const sel = selectRecentFailures(
+    [
+      head("triage", "model", "2026-08-04T17:30:00Z", {
+        status: "failed",
+        methodName: "investigate",
+        error: 'No model named "nightly" found.',
+      }, MODEL_TYPE),
+      head("widget", "model", "2026-08-04T17:00:00Z", {
+        status: "failed",
+        error: "401 Unauthorized",
+      }),
+    ],
+    NOW,
+    24,
+    "auto",
+    20,
+    [],
+    { selfType: MODEL_TYPE },
+  );
+  assertEquals(sel.failures.map((f) => [f.target, f.selfInflicted]), [
+    ["widget", false],
+    ["triage", true],
+  ]);
+  const text = buildRecentSummary(sel, 24);
+  assertEquals(text.includes("1 target(s) failed"), true);
+  assertEquals(text.includes("investigator's own runs (investigate)"), true);
+});
+
+Deno.test("recent: only the investigator failing reads as nothing in the fleet", () => {
+  const sel = selectRecentFailures(
+    [head("triage", "model", "2026-08-04T17:30:00Z", {
+      status: "failed",
+      methodName: "recent",
+    }, MODEL_TYPE)],
+    NOW,
+    24,
+    "auto",
+    20,
+    [],
+    { selfType: MODEL_TYPE },
+  );
+  const text = buildRecentSummary(sel, 24);
+  assertEquals(text.includes("Nothing in the fleet failed"), true);
+  assertEquals(text.includes("Run `investigate`"), false);
+});
+
+Deno.test("recent: each failure reports its definition path", () => {
+  const sel = selectRecentFailures(
+    [head("widget", "model", "2026-08-04T17:00:00Z", { status: "failed" })],
+    NOW,
+    24,
+    "auto",
+    20,
+    [],
+    {
+      definitions: [{
+        name: "widget",
+        kind: "model",
+        type: "@acme/thing",
+        id: "m-1",
+        definitionPath: "models/@acme/thing/m-1.yaml",
+        schedule: null,
+        tags: {},
+      }],
+    },
+  );
+  assertEquals(sel.failures[0].definitionPath, "models/@acme/thing/m-1.yaml");
+});
+
+Deno.test("recent: a success of the same method seconds later is a quick retry", async () => {
+  // The caller passed a bad value, saw the error, and retried with a good
+  // one. That is not the remote recovering, and must not read like it.
+  const { sel } = await recentOf(
+    history("m-1", "backup-a", [
+      ["2026-08-04T10:00:00Z", "succeeded"],
+      ["2026-08-04T17:00:00Z", "failed", "path a/file: not a directory"],
+      ["2026-08-04T17:00:17Z", "succeeded"],
+    ]),
+    24,
+  );
+  assertEquals(sel.failures[0].quickRetry, true);
+  assertEquals(
+    buildRecentSummary(sel, 24).includes("a caller correcting its own input"),
+    true,
+  );
+});
+
+Deno.test("recent: a recovery hours later is not a quick retry", async () => {
+  const { sel } = await recentOf(
+    history("m-1", "backup-a", [
+      ["2026-08-04T10:00:00Z", "failed", "connect ECONNREFUSED 192.0.2.1:22"],
+      ["2026-08-04T12:00:00Z", "succeeded"],
+    ]),
+    24,
+  );
+  assertEquals(sel.failures[0].quickRetry, false);
+});
+
+Deno.test("quick retry: a different method succeeding does not count", () => {
+  assertEquals(
+    isQuickRetry({
+      failed: head("m", "model", "2026-08-04T17:00:00Z", {
+        status: "failed",
+        methodName: "restore",
+      }),
+      recoveredAt: "2026-08-04T17:00:10Z",
+      recoveredMethod: "check",
+      failureCount: 1,
+    }),
+    false,
+  );
+});
+
+Deno.test("recent: a scheduled workflow that never ran here is listed", async () => {
+  const dir = await fixtureRepo({
+    "workflows/a.yaml": "id: w-a\nname: archive-monthly\ntags:\n" +
+      "  runs-on: scheduler-a\ntrigger:\n  schedule: '0 8 3 * *'\n",
+    "workflows/b.yaml": "id: w-b\nname: archive-daily\ntags:\n" +
+      "  runs-on: scheduler-a\ntrigger:\n  schedule: '0 1 * * *'\n",
+    "workflows/c.yaml": "id: w-c\nname: elsewhere-job\ntags:\n" +
+      "  runs-on: scheduler-b\ntrigger:\n  schedule: '0 2 * * *'\n",
+    "workflows/d.yaml": "id: w-d\nname: by-hand\n",
+  });
+  try {
+    const definitions = await listDefinitions(dir, "auto");
+    const heads = [
+      head("archive-daily", "workflow", "2026-08-04T01:00:00Z", {
+        status: "succeeded",
+      }),
+    ];
+    const here = selectRecentFailures(heads, NOW, 24, "auto", 20, [], {
+      definitions,
+      placement: parsePlacement("runs-on=scheduler-a"),
+    });
+    assertEquals(here.scheduledNeverRun.map((n) => n.target), [
+      "archive-monthly",
+    ]);
+    assertEquals(here.scheduledNeverRun[0].schedule, "0 8 3 * *");
+    // No placement: every scheduled workflow is meant to run here.
+    const any = selectRecentFailures(heads, NOW, 24, "auto", 20, [], {
+      definitions,
+    });
+    assertEquals(any.scheduledNeverRun.map((n) => n.target), [
+      "archive-monthly",
+      "elsewhere-job",
+    ]);
+    assertEquals(
+      buildRecentSummary(here, 24).includes("archive-monthly (`0 8 3 * *`)"),
+      true,
+    );
+    // kind=model asks about models only.
+    assertEquals(
+      selectRecentFailures(heads, NOW, 24, "model", 20, [], { definitions })
+        .scheduledNeverRun.length,
+      0,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("recent: the summary says when the window was capped", () => {
+  const sel = selectRecentFailures([], NOW, MAX_WINDOW_HOURS, "auto", 20);
+  assertEquals(
+    buildRecentSummary(sel, MAX_WINDOW_HOURS, 744).startsWith(
+      `Asked for 744h; the window is capped at ${MAX_WINDOW_HOURS}h.`,
+    ),
+    true,
+  );
+});
+
+/** A minimal method context over in-memory summary bodies. */
+function methodContext(
+  dir: string,
+  bodies: Record<string, Record<number, Record<string, unknown>>>,
+  records: {
+    name: string;
+    version: number;
+    modelId: string;
+    modelType: string;
+    tags?: Record<string, string>;
+  }[] = [],
+) {
+  const latestOf = (k: string) =>
+    Math.max(...Object.keys(bodies[k]).map(Number));
+  const written: {
+    spec: string;
+    instance: string;
+    data: Record<string, unknown>;
+  }[] = [];
+  const warnings: string[] = [];
+  const enc = new TextEncoder();
+  return {
+    written,
+    warnings,
+    context: {
+      repoDir: dir,
+      globalArgs: {},
+      writeResource: (spec: string, instance: string, data: unknown) => {
+        written.push({ spec, instance, data: data as Record<string, unknown> });
+        return Promise.resolve({ spec, instance });
+      },
+      queryData: () => Promise.resolve(records),
+      dataRepository: {
+        findByName: (type: string, id: string, _n: string, v?: number) => {
+          const k = `${type}/${id}`;
+          if (!bodies[k]) return Promise.resolve(null);
+          const version = v ?? latestOf(k);
+          return Promise.resolve(
+            bodies[k][version]
+              ? { version, createdAt: "2026-08-04T17:00:00Z" }
+              : null,
+          );
+        },
+        getContent: (type: string, id: string, _n: string, v?: number) => {
+          const k = `${type}/${id}`;
+          const b = bodies[k]?.[v ?? (bodies[k] ? latestOf(k) : 0)];
+          return Promise.resolve(b ? enc.encode(JSON.stringify(b)) : null);
+        },
+      },
+      logger: {
+        info: () => {},
+        warning: (msg: string) => {
+          warnings.push(msg);
+        },
+      },
+    },
+  };
+}
+
+const MONTHLY =
+  "id: w-1\nname: archive-nightly-dump\ntags:\n  runs-on: scheduler-a\n" +
+  "trigger:\n  schedule: '0 8 3 * *'\n";
+
+Deno.test("investigate: a scheduled workflow with no runs is a failing never-run finding", async () => {
+  // It used to throw, which recorded the investigation itself as a failure
+  // and read as "nothing to investigate" -- the opposite of the truth.
+  const dir = await fixtureRepo({ "workflows/w.yaml": MONTHLY });
+  try {
+    const { context, written } = methodContext(dir, {});
+    await model.methods.investigate.execute(
+      { target: "archive-nightly-dump", kind: "workflow", maxVersions: 60 },
+      context,
+    );
+    const finding = written.find((w) => w.instance === "current")!.data;
+    assertEquals(finding.currentStatus, "never-run");
+    assertEquals(finding.category, "never_run");
+    assertEquals(finding.failing, true);
+    assertEquals(finding.schedule, "0 8 3 * *");
+    assertEquals(String(finding.summary).includes("**failing**"), true);
+    assertEquals(
+      written.map((w) => w.instance).sort(),
+      ["archive-nightly-dump", "current"],
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("investigate: never-run placed on another scheduler is not failing here", async () => {
+  const dir = await fixtureRepo({ "workflows/w.yaml": MONTHLY });
+  try {
+    const { context, written } = methodContext(dir, {});
+    await model.methods.investigate.execute(
+      {
+        target: "archive-nightly-dump",
+        kind: "workflow",
+        maxVersions: 60,
+        placementTag: "runs-on=scheduler-b",
+      },
+      context,
+    );
+    const finding = written.find((w) => w.instance === "current")!.data;
+    assertEquals(finding.failing, false);
+    assertEquals(
+      String(finding.meaning).includes("placed on runs-on=scheduler-a"),
+      true,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("investigate: an unknown name suggests the closest real ones", async () => {
+  const dir = await fixtureRepo({
+    "workflows/w.yaml": MONTHLY,
+    "models/@acme/thing/m.yaml": "type: '@acme/thing'\nid: m-1\nname: widget\n",
+  });
+  try {
+    const { context } = methodContext(dir, {});
+    let message = "";
+    try {
+      await model.methods.investigate.execute(
+        { target: "nightly-dump", kind: "auto", maxVersions: 60 },
+        context,
+      );
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    assertEquals(
+      message.includes("Closest names: archive-nightly-dump (workflow)"),
+      true,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("investigate: an input error says which arguments came from the caller", async () => {
+  const dir = await fixtureRepo({
+    "models/@acme/thing/m.yaml": "type: '@acme/thing'\nid: m-1\nname: widget\n",
+  });
+  try {
+    const { context, written } = methodContext(dir, {
+      "@acme/thing/m-1": {
+        1: {
+          status: "failed",
+          methodName: "restore",
+          error: "Method arguments validation failed: path is required",
+          methodArgs: ["path", "target"],
+          globalArgs: ["repository"],
+        },
+      },
+    });
+    await model.methods.investigate.execute(
+      { target: "widget", kind: "model", maxVersions: 60 },
+      context,
+    );
+    const finding = written.find((w) => w.instance === "current")!.data;
+    assertEquals(finding.category, "caller_args");
+    assertEquals(finding.callArgs, ["path", "target"]);
+    assertEquals(finding.definitionArgs, ["repository"]);
+    assertEquals(
+      String(finding.summary).includes(
+        "Arguments passed by the caller on each run: path, target. Set in " +
+          "the definition (models/@acme/thing/m.yaml): repository.",
+      ),
+      true,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("recent: an over-wide window is capped with a warning, not refused", async () => {
+  const dir = await fixtureRepo({});
+  try {
+    const { context, written, warnings } = methodContext(dir, {});
+    await model.methods.recent.execute(
+      { withinHours: 744, kind: "auto", limit: 20, maxVersions: 60 },
+      context,
+    );
+    const rec = written.find((w) => w.instance === "recent")!.data;
+    assertEquals(rec.withinHours, MAX_WINDOW_HOURS);
+    assertEquals(rec.requestedHours, 744);
+    assertEquals(warnings.length, 1);
+    // The method's schema accepts it, so the call itself never fails.
+    assertEquals(
+      model.methods.recent.arguments.safeParse({ withinHours: 744 }).success,
+      true,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("model: MODEL_TYPE is the model's own type", () => {
+  assertEquals(model.type, MODEL_TYPE);
 });

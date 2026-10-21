@@ -50,8 +50,30 @@ swamp model @sntxrr/swamp-triage/investigation method run investigate <name> \
 | `target`      | —       | Name of the model or workflow to investigate         |
 | `kind`        | `auto`  | `auto`, `model`, or `workflow`                       |
 | `maxVersions` | `60`    | How far back to walk when looking for the last success |
+| `placementTag` | —      | `key=value` tag naming the workflows this datastore runs |
 
 Read-only. It never invokes the target it is investigating.
+
+**A name that matches nothing** is still an error, since there is no target to
+write a finding for. The error names the closest definitions by word overlap,
+so `nightly-dump` gets `Closest names: archive-nightly-dump (workflow)`. An
+agent working from an alert's wording usually gets a name nearly right, and
+without a suggestion each wrong guess is one more failed run.
+
+**A target with no recorded run** gets a finding with `currentStatus:
+never-run` and category `never_run`. It is no longer an error. A scheduled
+workflow (`trigger.schedule`) with no run is reported **`failing: true`**: a
+schedule that never fires leaves no failure anywhere else, so this is the case
+that needs saying. Some workflows only run in another datastore, such as a
+different scheduler host. Pass `placementTag` (e.g. `runs-on=primary`) and a
+workflow whose tags name a different place reads as not failing here. An
+unscheduled target with no run is not failing.
+
+**Input errors say where the input lives.** For `config` and `caller_args`,
+the finding lists `callArgs` (argument names passed by the caller on each run)
+and `definitionArgs` (set in the definition file). A bad per-call argument is
+not in the YAML, so "fix the definition" would be the wrong advice. Swamp
+records argument names only, never the values a run used.
 
 Writes the finding as an `investigation` resource — carrying the
 classification, the last-success/first-failure boundary, the redacted error, and
@@ -67,10 +89,11 @@ swamp model @sntxrr/swamp-triage/investigation method run recent <name> \
 
 | Argument      | Default | Meaning                                                  |
 | ------------- | ------- | -------------------------------------------------------- |
-| `withinHours` | `24`    | How far back to look for failed runs (1–720)             |
+| `withinHours` | `24`    | How far back to look; values above 720 are capped at 720 |
 | `kind`        | `auto`  | `auto`, `model`, or `workflow`                           |
 | `limit`       | `20`    | Maximum failures to list; the rest are counted, not lost |
 | `maxVersions` | `60`    | Earlier runs read per recovered target (1–500)           |
+| `placementTag` | —      | `key=value`; only these workflows are checked for never-run |
 
 `investigate` needs a name, and an alert does not always carry one: a relayed
 notification can arrive with no body, and "what just broke?" has no name in it.
@@ -113,6 +136,24 @@ argument does not apply: `recent` reads the datastore of the repo it runs in.
 It needs a swamp runtime that provides `context.queryData`, and says so rather
 than returning an empty list when it does not.
 
+Three flags separate what the fleet did from what the caller did:
+
+- **`selfInflicted`** marks a failed run of this investigator's own type, such
+  as a bad name or argument from whoever ran triage. These are listed after
+  every other failure and summarised in one line as caller errors, so an agent
+  re-reading its own mistakes does not report them as an outage.
+- **`quickRetry`** marks a recovered failure whose next run, of the same method,
+  succeeded within 60 seconds. A remote that heals on its own does not do so on
+  the very next call; a caller retrying with a corrected value does.
+- **`definitionPath`** is the repo-relative definition file, or null for a
+  workflow bundled in an extension. Quote it rather than building a path from
+  the name.
+
+`scheduledNeverRun` lists every scheduled workflow with no recorded run at all
+in this datastore, limited to `placementTag` when given. `withinHours` above 720
+is capped with a warning rather than refused, and `requestedHours` records what
+was asked. A refused call would itself be recorded as a failure.
+
 Read-only, like `investigate`.
 
 ## Categories
@@ -127,7 +168,9 @@ The categories are chosen by **where they send you**, not by protocol trivia.
 | `tls`         | Failed at the transport layer, before the request        |
 | `rate_limit`  | Refused on volume, not correctness                       |
 | `not_found`   | Answered, but the addressed resource is gone             |
-| `config`      | Never left swamp — arguments failed validation           |
+| `caller_args` | The call's arguments failed the method schema — look at the caller |
+| `config`      | Never left swamp — the definition or its inputs are wrong |
+| `never_run`   | No run recorded here; failing only if scheduled to run here |
 | `unknown`     | No rule matched; reported verbatim rather than guessed   |
 | `unrecorded`  | Failed, but no error text was recorded or recoverable    |
 | `none`        | No error recorded; the target is not failing             |

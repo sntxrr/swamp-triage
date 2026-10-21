@@ -170,6 +170,20 @@ const RULES: Rule[] = [
       "model definition against what is actually there.",
   },
   {
+    // Swamp's own wording when a call's arguments fail the method's schema.
+    // Ahead of `config`, which would match "validation failed" and send the
+    // operator to the definition -- but the definition holds no method
+    // arguments. The call was wrong, so look at whoever made it.
+    category: "caller_args",
+    patterns: [/method arguments validation failed/i],
+    meaning: "The call was rejected before it ran: the arguments passed to " +
+      "this method failed its schema. The definition and the remote are not " +
+      "involved -- whoever made the call passed a bad value.",
+    nextStep: "Find the caller -- a workflow step's inputs, a cron line, or " +
+      "an agent's ad-hoc call -- and fix the argument it passes. A success " +
+      "seconds later usually means the caller already corrected itself.",
+  },
+  {
     category: "config",
     patterns: [
       /validation[ _-]?failed/i,
@@ -475,6 +489,10 @@ export interface ResolvedTarget {
   id: string;
   /** Repo-relative path of the definition that supplied the mapping. */
   definitionPath: string;
+  /** A workflow's `trigger.schedule` cron, or null when it has none. */
+  schedule: string | null;
+  /** A workflow's `tags`, e.g. a placement tag naming where it runs. */
+  tags: Record<string, string>;
 }
 
 /**
@@ -505,19 +523,105 @@ export function readTopLevelScalars(text: string): Record<string, string> {
     if (line.trimEnd() === "" || line.startsWith("#")) continue;
     const m = /^([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$/.exec(line);
     if (!m) continue;
-    const key = m[1];
-    let value = m[2].trim();
-    if (value === "" || value.startsWith(">") || value.startsWith("|")) {
-      continue;
-    }
-    // Strip an inline comment only when the value is not quoted.
-    if (!/^["']/.test(value)) value = value.replace(/\s+#.*$/, "").trim();
-    // Unwrap matching surrounding quotes.
-    const q = /^(["'])([\s\S]*)\1$/.exec(value);
-    if (q) value = q[2];
-    if (value !== "") out[key] = value;
+    const value = scalarValue(m[2]);
+    if (value !== null) out[m[1]] = value;
   }
   return out;
+}
+
+/**
+ * Normalize the value half of a `key: value` line, or null when it is empty
+ * or opens a block scalar.
+ */
+function scalarValue(raw: string): string | null {
+  let value = raw.trim();
+  if (value === "" || value.startsWith(">") || value.startsWith("|")) {
+    return null;
+  }
+  // Strip an inline comment only when the value is not quoted.
+  if (!/^["']/.test(value)) value = value.replace(/\s+#.*$/, "").trim();
+  // Unwrap matching surrounding quotes.
+  const q = /^(["'])([\s\S]*)\1$/.exec(value);
+  if (q) value = q[2];
+  return value === "" ? null : value;
+}
+
+/**
+ * Read the scalar children of one top-level mapping, e.g. `trigger` or `tags`.
+ *
+ * The same deliberate non-parser as `readTopLevelScalars`, one level down:
+ * only lines at the mapping's first child indentation count, so a grandchild
+ * or the body of a block scalar cannot be mistaken for a child. The mapping
+ * ends at the next column-zero line.
+ *
+ * @param text Raw file contents.
+ * @param parent Top-level key whose children to read.
+ * @returns The child scalar fields found; empty when the key is absent.
+ */
+export function readNestedScalars(
+  text: string,
+  parent: string,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  let inside = false;
+  let indent: string | null = null;
+  for (const line of text.split("\n")) {
+    if (line.trimEnd() === "" || /^\s*#/.test(line)) continue;
+    if (!/^\s/.test(line)) {
+      // A column-zero line opens or closes the mapping.
+      inside = new RegExp(`^${parent}:\\s*(#.*)?$`).test(line.trimEnd());
+      indent = null;
+      continue;
+    }
+    if (!inside) continue;
+    const lead = /^(\s+)/.exec(line)![1];
+    if (indent === null) indent = lead;
+    if (lead !== indent) continue;
+    const m = /^\s+([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$/.exec(line);
+    if (!m) continue;
+    const value = scalarValue(m[2]);
+    if (value !== null) out[m[1]] = value;
+  }
+  return out;
+}
+
+/**
+ * Rank definition names by how well they match a name that resolved to none.
+ *
+ * An agent guessing at a target from an alert's wording gets the name nearly
+ * right -- `nightly-dump` for `archive-nightly-dump`. A flat "not found" sends
+ * it guessing again; each wrong guess is another failed run. Token overlap
+ * (Jaccard over `-`, `_`, `/`, `.`, `@` separated words) plus a bonus when one
+ * name contains the other is enough to put the intended name first, and is
+ * predictable enough to explain.
+ *
+ * @param query The name that was not found.
+ * @param candidates Every definition, as `listDefinitions` returns them.
+ * @param limit Most suggestions to return.
+ * @returns Best matches first; never a candidate sharing nothing with query.
+ */
+export function rankNames(
+  query: string,
+  candidates: { name: string; kind: string }[],
+  limit = 3,
+): { name: string; kind: string; score: number }[] {
+  const words = (s: string) =>
+    new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w !== ""));
+  const q = words(query);
+  const needle = query.toLowerCase();
+  const scored: { name: string; kind: string; score: number }[] = [];
+  for (const c of candidates) {
+    const w = words(c.name);
+    const shared = [...q].filter((x) => w.has(x)).length;
+    const union = new Set([...q, ...w]).size;
+    const hay = c.name.toLowerCase();
+    const contains = needle !== "" &&
+      (hay.includes(needle) || needle.includes(hay));
+    const score = (union === 0 ? 0 : shared / union) + (contains ? 0.5 : 0);
+    if (score > 0) scored.push({ ...c, score: Math.round(score * 100) / 100 });
+  }
+  scored.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  return scored.slice(0, limit);
 }
 
 /**
@@ -566,6 +670,24 @@ export async function resolveTargets(
   target: string,
   kind: string,
 ): Promise<ResolvedTarget[]> {
+  return (await listDefinitions(repoDir, kind)).filter((d) =>
+    d.name === target
+  );
+}
+
+/**
+ * Every model or workflow definition in the repo, in search order.
+ *
+ * The one walk behind name resolution, name suggestions, the definition path
+ * `recent` reports, and the scheduled workflows it checks for a missing run.
+ *
+ * @param repoDir Repository root.
+ * @param kind "model", "workflow", or "auto" for both.
+ */
+export async function listDefinitions(
+  repoDir: string,
+  kind: string,
+): Promise<ResolvedTarget[]> {
   const search: { kind: string; dir: string }[] = [];
   if (kind === "model" || kind === "auto") {
     search.push({ kind: "model", dir: `${repoDir}/models` });
@@ -589,19 +711,22 @@ export async function resolveTargets(
         continue;
       }
       const doc = readTopLevelScalars(text);
-      if (doc.name !== target) continue;
       const id = doc.id;
-      if (!id) continue;
+      if (!doc.name || !id) continue;
       const type = k === "workflow" ? "workflow" : doc.type;
       if (!type) continue;
       matches.push({
-        name: target,
+        name: doc.name,
         kind: k,
         type,
         id,
         definitionPath: path.startsWith(repoDir + "/")
           ? path.slice(repoDir.length + 1)
           : path,
+        schedule: k === "workflow"
+          ? readNestedScalars(text, "trigger").schedule ?? null
+          : null,
+        tags: k === "workflow" ? readNestedScalars(text, "tags") : {},
       });
     }
   }
@@ -652,8 +777,53 @@ export interface RecoveredFailure {
   failed: SummaryHead;
   /** When the first success after that failure was recorded. */
   recoveredAt: string;
+  /** The method that success ran, to tell a retry from a different call. */
+  recoveredMethod: string | null;
   /** Failed runs inside the window. */
   failureCount: number;
+}
+
+/**
+ * A failure followed this soon by a success of the same method is a caller
+ * correcting its own input -- an agent or a person retrying with a different
+ * value -- not the remote coming back. Nothing that heals on its own does so
+ * in under a minute and on the very next call.
+ */
+export const QUICK_RETRY_SECONDS = 60;
+
+/** The widest `recent` window; a wider request is capped, not refused. */
+export const MAX_WINDOW_HOURS = 720;
+
+/** A `key=value` placement tag, e.g. `runs-on=scheduler-a`. */
+export interface Placement {
+  key: string;
+  value: string;
+}
+
+/**
+ * Parse a `key=value` placement tag, or null for an empty one.
+ *
+ * @throws When the text is not `key=value` -- a placement that silently
+ *   matched nothing would make every scheduled workflow read as elsewhere.
+ */
+export function parsePlacement(text: string | undefined): Placement | null {
+  const t = (text ?? "").trim();
+  if (t === "") return null;
+  const m = /^([^=\s]+)=(.+)$/.exec(t);
+  if (!m) {
+    throw new Error(
+      `placementTag must be key=value (e.g. runs-on=primary), got "${t}".`,
+    );
+  }
+  return { key: m[1], value: m[2].trim() };
+}
+
+/** True when no placement was given, or the tags carry it. */
+export function placedHere(
+  tags: Record<string, string>,
+  placement: Placement | null,
+): boolean {
+  return placement === null || tags[placement.key] === placement.value;
 }
 
 /** One target that failed within the window. */
@@ -686,6 +856,26 @@ export interface RecentFailure {
    * streak.
    */
   failureCount: number | null;
+  /**
+   * The failure is one of this investigator's own runs -- a bad name or
+   * argument from whoever ran triage. A caller error, not a fleet failure.
+   */
+  selfInflicted: boolean;
+  /**
+   * The newest failure was followed within `QUICK_RETRY_SECONDS` by a success
+   * of the same method: a caller correcting its own input. Always false for
+   * a target still failing.
+   */
+  quickRetry: boolean;
+  /** Repo-relative definition file; null for one bundled in an extension. */
+  definitionPath: string | null;
+}
+
+/** A scheduled workflow with no recorded run at all in this datastore. */
+export interface NeverRun {
+  target: string;
+  schedule: string;
+  definitionPath: string;
 }
 
 /** What `recent` found, before it is recorded. */
@@ -700,6 +890,11 @@ export interface RecentSelection {
    * read as healthy; widen the window to list them.
    */
   staleFailing: number;
+  /**
+   * Scheduled workflows that have never run here. A schedule that never fires
+   * leaves no failure behind, so it is invisible to every other check.
+   */
+  scheduledNeverRun: NeverRun[];
 }
 
 /**
@@ -763,7 +958,31 @@ export function describeFailure(
     failing: true,
     recoveredAt: null,
     failureCount: null,
+    selfInflicted: false,
+    quickRetry: false,
+    definitionPath: null,
   };
+}
+
+/** Whether a recovered failure was a caller retrying with different input. */
+export function isQuickRetry(r: RecoveredFailure): boolean {
+  const failedAt = Date.parse(r.failed.createdAt);
+  const backAt = Date.parse(r.recoveredAt);
+  if (isNaN(failedAt) || isNaN(backAt)) return false;
+  const method = r.failed.body.methodName;
+  const sameMethod = typeof method !== "string" || r.recoveredMethod === null ||
+    r.recoveredMethod === method;
+  return sameMethod && backAt - failedAt <= QUICK_RETRY_SECONDS * 1000;
+}
+
+/** What `selectRecentFailures` needs beyond the window itself. */
+export interface RecentOptions {
+  /** The investigator's own model type; its failures are caller errors. */
+  selfType?: string;
+  /** Every definition, to report paths and find scheduled never-run ones. */
+  definitions?: ResolvedTarget[];
+  /** Only workflows carrying this tag count as scheduled to run here. */
+  placement?: Placement | null;
 }
 
 /**
@@ -780,6 +999,8 @@ export function describeFailure(
  * @param kind "model", "workflow", or "auto" for both.
  * @param limit Maximum failures to return.
  * @param recovered Targets found by `readRecoveredFailures`.
+ * @param opts The investigator's own type, the repo's definitions, and the
+ *   placement tag -- each optional, each only adding to what is reported.
  */
 export function selectRecentFailures(
   heads: SummaryHead[],
@@ -788,6 +1009,7 @@ export function selectRecentFailures(
   kind: string,
   limit: number,
   recovered: RecoveredFailure[] = [],
+  opts: RecentOptions = {},
 ): RecentSelection {
   const since = nowMs - withinHours * 3_600_000;
   const methodBodies = new Map<string, Record<string, unknown>>();
@@ -820,19 +1042,58 @@ export function selectRecentFailures(
     .filter((r) => kind === "auto" || r.failed.kind === kind)
     .sort((a, b) => when(b.failed) - when(a.failed));
 
-  const all: RecentFailure[] = [
-    ...inWindow.map((h) => describeFailure(h, methodBodies)),
-    ...back.map((r) => ({
-      ...describeFailure(r.failed, methodBodies),
-      failing: false,
-      recoveredAt: r.recoveredAt,
-      failureCount: r.failureCount,
-    })),
+  const defs = opts.definitions ?? [];
+  const pathOf = (target: string, k: string) =>
+    defs.find((d) => d.name === target && d.kind === k)?.definitionPath ??
+      null;
+  const mark = (f: RecentFailure): RecentFailure => ({
+    ...f,
+    selfInflicted: opts.selfType !== undefined &&
+      f.targetType === opts.selfType,
+    definitionPath: pathOf(f.target, f.kind),
+  });
+
+  const listed: RecentFailure[] = [
+    ...inWindow.map((h) => mark(describeFailure(h, methodBodies))),
+    ...back.map((r) =>
+      mark({
+        ...describeFailure(r.failed, methodBodies),
+        failing: false,
+        recoveredAt: r.recoveredAt,
+        failureCount: r.failureCount,
+        quickRetry: isQuickRetry(r),
+      })
+    ),
   ];
+  // The investigator's own failures go last: they are about whoever called
+  // it, so they must never crowd a fleet failure out of `limit`.
+  const all = [
+    ...listed.filter((f) => !f.selfInflicted),
+    ...listed.filter((f) => f.selfInflicted),
+  ];
+
+  // A workflow is "run" here if any summary of it exists, in or out of the
+  // window: this looks for schedules that have never fired at all.
+  const ran = new Set(
+    heads.filter((h) => h.kind === "workflow").map((h) => h.target),
+  );
+  const scheduledNeverRun: NeverRun[] = kind === "model" ? [] : defs
+    .filter((d) =>
+      d.kind === "workflow" && d.schedule !== null && !ran.has(d.name) &&
+      placedHere(d.tags, opts.placement ?? null)
+    )
+    .map((d) => ({
+      target: d.name,
+      schedule: d.schedule!,
+      definitionPath: d.definitionPath,
+    }))
+    .sort((a, b) => a.target.localeCompare(b.target));
+
   return {
     failures: all.slice(0, limit),
     omitted: Math.max(0, all.length - limit),
     staleFailing,
+    scheduledNeverRun,
   };
 }
 
@@ -869,9 +1130,13 @@ export async function readRecoveredFailures(
     const headAt = Date.parse(h.createdAt);
     if (!isNaN(headAt) && headAt < since) continue;
 
+    const methodOf = (b: Record<string, unknown>) =>
+      typeof b.methodName === "string" ? b.methodName : null;
     let newerAt = h.createdAt;
+    let newerMethod = methodOf(h.body);
     let failed: SummaryHead | null = null;
     let recoveredAt = "";
+    let recoveredMethod: string | null = null;
     let failureCount = 0;
     let leftWindow = false;
     const floor = Math.max(1, h.version - maxVersions);
@@ -903,18 +1168,24 @@ export async function readRecoveredFailures(
       }
       if (body.status === "succeeded") {
         // Only successes newer than the newest failure mark the recovery.
-        if (!failed) newerAt = at;
+        if (!failed) {
+          newerAt = at;
+          newerMethod = methodOf(body);
+        }
         continue;
       }
       failureCount++;
       if (!failed) {
         failed = { ...h, createdAt: at, body, version: v };
         recoveredAt = newerAt;
+        recoveredMethod = newerMethod;
       }
     }
     // Reaching version 1 is the whole history, not a truncated walk.
     if (!leftWindow && floor > 1) truncated++;
-    if (failed) recovered.push({ failed, recoveredAt, failureCount });
+    if (failed) {
+      recovered.push({ failed, recoveredAt, recoveredMethod, failureCount });
+    }
   }
   return { recovered, truncated };
 }
@@ -923,18 +1194,28 @@ export async function readRecoveredFailures(
 export function buildRecentSummary(
   sel: RecentSelection,
   withinHours: number,
+  requestedHours = withinHours,
 ): string {
   const lines: string[] = [];
+  if (requestedHours > withinHours) {
+    lines.push(
+      `Asked for ${requestedHours}h; the window is capped at ${withinHours}h.`,
+    );
+  }
+  const fleet = sel.failures.filter((f) => !f.selfInflicted);
+  const own = sel.failures.filter((f) => f.selfInflicted);
   if (sel.failures.length === 0) {
     lines.push(`Nothing has failed in the last ${withinHours}h.`);
   } else {
-    const back = sel.failures.filter((f) => !f.failing).length;
+    const back = fleet.filter((f) => !f.failing).length;
     lines.push(
-      `${sel.failures.length + sel.omitted} target(s) failed in the last ` +
-        `${withinHours}h, newest first` +
-        (back > 0 ? `; still failing listed before recovered:` : ":"),
+      fleet.length === 0
+        ? `Nothing in the fleet failed in the last ${withinHours}h.`
+        : `${fleet.length + sel.omitted} target(s) failed in the last ` +
+          `${withinHours}h, newest first` +
+          (back > 0 ? `; still failing listed before recovered:` : ":"),
     );
-    for (const f of sel.failures) {
+    for (const f of fleet) {
       const where = f.failingMethod ? ` at \`${f.failingMethod}\`` : "";
       // A model's type is what a run-history line names; show it so the two
       // can be matched by eye.
@@ -943,15 +1224,42 @@ export function buildRecentSummary(
         ? `, ${f.failedAt}`
         : ` — failed ${f.failureCount}x, last at ${f.failedAt}, recovered ` +
           `at ${f.recoveredAt}`;
+      const retry = f.quickRetry
+        ? " — the same method succeeded seconds later: a caller correcting " +
+          "its own input, not the remote recovering"
+        : "";
       lines.push(
-        `- ${f.target} (${what})${where} — **${f.category}**${state}`,
+        `- ${f.target} (${what})${where} — **${f.category}**${state}${retry}`,
       );
     }
     if (sel.omitted > 0) {
       lines.push(`- …and ${sel.omitted} more; raise \`limit\` to list them.`);
     }
+    if (own.length > 0) {
+      // Counted apart, never as fleet failures: these are this investigator's
+      // own runs, failed by a bad name or argument from whoever called it.
+      const what = [...new Set(own.map((f) => f.failingMethod ?? f.target))];
+      lines.push(
+        `${own.length} failure(s) were this investigator's own runs ` +
+          `(${what.join(", ")}): a caller's bad name or argument, not a ` +
+          `fleet failure. Nothing to fix in the fleet for these.`,
+      );
+    }
+    if (fleet.length > 0) {
+      lines.push(
+        "Run `investigate` on one of these for its full timeline and next " +
+          "step.",
+      );
+    }
+  }
+  if (sel.scheduledNeverRun.length > 0) {
     lines.push(
-      "Run `investigate` on one of these for its full timeline and next step.",
+      `${sel.scheduledNeverRun.length} scheduled workflow(s) have no recorded ` +
+        `run in this datastore: ` +
+        sel.scheduledNeverRun.map((n) => `${n.target} (\`${n.schedule}\`)`)
+          .join(", ") +
+        `. A schedule that never fires leaves no failure behind; check the ` +
+        `scheduler that is meant to run each one.`,
     );
   }
   if (sel.staleFailing > 0) {
@@ -995,6 +1303,15 @@ const InvestigationSchema = z.object({
   lastSuccessMethod: z.string().nullable(),
   successOutsideWindow: z.boolean(),
   runsExamined: z.number(),
+  /** A workflow's trigger cron; null for a model or an unscheduled workflow. */
+  schedule: z.string().nullable(),
+  /**
+   * Argument names the failing run took per call -- set by whoever called
+   * it, never in the definition. Values are not recorded, only names.
+   */
+  callArgs: z.array(z.string()),
+  /** Argument names set in the definition itself (global arguments). */
+  definitionArgs: z.array(z.string()),
   /** One-paragraph plain-language finding, suitable for a notification body. */
   summary: z.string(),
 });
@@ -1026,11 +1343,27 @@ const RecentSchema = z.object({
     recoveredAt: z.string().nullable(),
     /** Failed runs in the window, for a recovered target; else null. */
     failureCount: z.number().nullable(),
+    /** One of this investigator's own runs: a caller error. */
+    selfInflicted: z.boolean(),
+    /** Recovered by the same method within a minute: a caller's retry. */
+    quickRetry: z.boolean(),
+    /** Repo-relative definition file; null when bundled in an extension. */
+    definitionPath: z.string().nullable(),
   })),
   /** Targets that failed inside the window left out by `limit`. */
   omitted: z.number(),
   /** Targets still failing whose last run predates the window. */
   staleFailing: z.number(),
+  /** The window asked for, before capping at the maximum. */
+  requestedHours: z.number(),
+  /** Scheduled workflows with no recorded run here at all. */
+  scheduledNeverRun: z.array(z.object({
+    target: z.string(),
+    schedule: z.string(),
+    definitionPath: z.string(),
+  })),
+  /** The placement tag the never-run check was limited to, if any. */
+  placementTag: z.string().nullable(),
   /**
    * Recovered targets whose history walk hit `maxVersions` inside the window;
    * an older failure of theirs was not seen. Raise `maxVersions` to see it.
@@ -1216,6 +1549,41 @@ export function sanitizeInstanceName(name: string): string {
 /** Instance names the model writes to on every run, whatever the target. */
 const RESERVED_INSTANCES = new Set(["current", "recent"]);
 
+/**
+ * Write a finding under its per-target instance and under `current`.
+ *
+ * Two instances of the same finding, deliberately. The per-target instance
+ * keeps history: investigate the same thing twice and the versions are
+ * comparable to each other. Its name is sanitized, because swamp rejects `/`
+ * in a data name and a bundled workflow's name is required to be
+ * collective-scoped.
+ *
+ * `current` is the stable handle a workflow can reference without knowing the
+ * target's name at all -- `data.latest('triage', 'current')`. Deriving the
+ * instance from the target meant the reference had to reproduce the
+ * sanitization in CEL, which is both awkward and one more place for the two to
+ * drift apart.
+ *
+ * Concurrent investigations race on `current`; the per-target instance is the
+ * one to read when that matters.
+ */
+async function recordFinding(
+  context: Pick<Context, "writeResource">,
+  finding: z.infer<typeof InvestigationSchema>,
+): Promise<unknown[]> {
+  const perTarget = await context.writeResource(
+    "investigation",
+    sanitizeInstanceName(finding.target),
+    finding,
+  );
+  const current = await context.writeResource(
+    "investigation",
+    "current",
+    finding,
+  );
+  return [perTarget, current];
+}
+
 /** Render the investigation as a paragraph an operator can act on directly. */
 function buildSummary(
   t: ResolvedTarget,
@@ -1224,6 +1592,7 @@ function buildSummary(
   error: string | null,
   failingMethod: string | null,
   rootCauseModel: string | null,
+  args: { call: string[]; definition: string[] } = { call: [], definition: [] },
 ): string {
   if (tl.currentStatus === "succeeded") {
     return `${t.name} (${t.kind}) is not currently failing -- its most ` +
@@ -1258,13 +1627,83 @@ function buildSummary(
     );
   }
   if (error) parts.push(`Recorded error: ${error}`);
+  // Where an input-shaped error points depends on where the input lives. A
+  // per-call argument is not in the definition file, so "fix the YAML" is the
+  // wrong advice for one -- and only the names are recorded, never values.
+  if (
+    (c.category === "config" || c.category === "caller_args") &&
+    (args.call.length > 0 || args.definition.length > 0)
+  ) {
+    const list = (a: string[]) => a.length ? a.join(", ") : "none";
+    parts.push(
+      `Arguments passed by the caller on each run: ${list(args.call)}. Set ` +
+        `in the definition (${t.definitionPath}): ${list(args.definition)}. ` +
+        `Only names are recorded, not the values a run used.`,
+    );
+  }
   parts.push(`Next step: ${c.nextStep}`);
   return parts.join("\n\n");
 }
 
+/**
+ * The finding for a target with no recorded run at all.
+ *
+ * This used to be an error, which had two costs: the investigation itself was
+ * recorded as a failed run -- noise in the next `recent` -- and a scheduled
+ * workflow that had never fired read as "nothing to investigate". That case is
+ * the alarming one: a schedule that never runs leaves no failure anywhere.
+ *
+ * @param t The resolved target.
+ * @param placement The placement tag this datastore runs, if given.
+ */
+export function neverRunFinding(
+  t: ResolvedTarget,
+  placement: Placement | null,
+): { failing: boolean; classification: Classification; summary: string } {
+  const scheduled = t.schedule !== null;
+  const here = placedHere(t.tags, placement);
+  const failing = scheduled && here;
+  const placed = placement ? ` (${placement.key}=${placement.value})` : "";
+  const elsewhere = placement && t.tags[placement.key]
+    ? `${placement.key}=${t.tags[placement.key]}`
+    : "another datastore";
+  const meaning = !scheduled
+    ? "No run of this target is recorded in this datastore, and it has no " +
+      "schedule. It may only ever run by hand, or in another datastore."
+    : here
+    ? `It is scheduled (\`${t.schedule}\`) to run here${placed}, but no run ` +
+      `is recorded at all. The scheduler is not firing it, or its history ` +
+      `was lost.`
+    : `It is scheduled (\`${t.schedule}\`) but placed on ${elsewhere}, not ` +
+      `here${placed}, so no run here is expected.`;
+  const nextStep = failing
+    ? "Check the scheduler that should run it -- is the trigger registered, " +
+      "and is its next run in the future? -- then whether this datastore is " +
+      "younger than one schedule period. Run it once by hand if a slot was " +
+      "missed."
+    : "Investigate it where it runs; nothing here says it is broken.";
+  return {
+    failing,
+    classification: {
+      category: "never_run",
+      matched: true,
+      meaning,
+      nextStep,
+    },
+    summary: `${t.name} (${t.kind}) has never run in this datastore` +
+      (failing ? ", and is **failing** to run on schedule. " : ". ") +
+      `${meaning}\n\nNext step: ${nextStep}`,
+  };
+}
+
+/** This model's own type; its failures in `recent` are caller errors. */
+export const MODEL_TYPE = "@sntxrr/swamp-triage/investigation";
+
+// The type stays a string literal here: the registry catalog only lists a
+// behavior whose `type` it can read without evaluating code.
 export const model = {
   type: "@sntxrr/swamp-triage/investigation",
-  version: "2026.09.28.1",
+  version: "2026.10.21.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1288,6 +1727,12 @@ export const model = {
       toVersion: "2026.09.28.1",
       description: "`recent` also lists targets that failed in the window " +
         "and have since recovered; global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.21.1",
+      description: "Tell caller mistakes and never-run schedules apart from " +
+        "fleet failures; global arguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1325,19 +1770,41 @@ export const model = {
           "How many recorded runs to walk back through when looking for the " +
             "last success.",
         ),
+        placementTag: z.string().optional().describe(
+          "key=value tag (e.g. runs-on=primary) naming the workflows this " +
+            "datastore runs. A scheduled workflow with no recorded run is " +
+            "only reported failing when it carries this tag. Omit to treat " +
+            "every scheduled workflow as meant to run here.",
+        ),
       }),
       execute: async (
-        args: { target: string; kind: string; maxVersions: number },
+        args: {
+          target: string;
+          kind: string;
+          maxVersions: number;
+          placementTag?: string;
+        },
         context: Context,
       ) => {
         const repoDir = context.globalArgs.repoDir ?? context.repoDir;
+        const placement = parsePlacement(args.placementTag);
 
-        const matches = await resolveTargets(repoDir, args.target, args.kind);
+        const definitions = await listDefinitions(repoDir, args.kind);
+        const matches = definitions.filter((d) => d.name === args.target);
         if (matches.length === 0) {
+          // Still an error -- there is no target to write a finding for --
+          // but one that names the likely target, so the caller's next try is
+          // right instead of another guess.
+          const near = rankNames(args.target, definitions);
           throw new Error(
             `No ${args.kind === "auto" ? "model or workflow" : args.kind} ` +
-              `named "${args.target}" found in ${repoDir}. Check the name ` +
-              `with \`swamp model list\` or \`swamp workflow list\`.`,
+              `named "${args.target}" found in ${repoDir}.` +
+              (near.length > 0
+                ? ` Closest names: ${
+                  near.map((n) => `${n.name} (${n.kind})`).join(", ")
+                }.`
+                : ` Check the name with \`swamp model list\` or ` +
+                  `\`swamp workflow list\`.`),
           );
         }
         const target = matches[0];
@@ -1373,11 +1840,46 @@ export const model = {
           dataName,
         );
         if (!latest) {
-          throw new Error(
-            `No summary reports recorded for ${target.kind} ` +
-              `"${target.name}". It may never have run in this repo, or its ` +
-              `report data may have aged out of retention.`,
+          const nr = neverRunFinding(target, placement);
+          context.logger.info(
+            "{name}: no recorded run (scheduled: {schedule}, failing: {failing})",
+            {
+              name: target.name,
+              schedule: target.schedule ?? "no",
+              failing: nr.failing,
+            },
           );
+          return {
+            dataHandles: await recordFinding(context, {
+              target: target.name,
+              targetKind: target.kind,
+              targetType: target.type,
+              targetId: target.id,
+              definitionPath: target.definitionPath,
+              investigatedAt: new Date().toISOString(),
+              failing: nr.failing,
+              currentStatus: "never-run",
+              category: nr.classification.category,
+              categoryMatched: nr.classification.matched,
+              meaning: nr.classification.meaning,
+              nextStep: nr.classification.nextStep,
+              error: null,
+              failingMethod: null,
+              rootCauseModel: null,
+              redactions: 0,
+              redactedKinds: [],
+              consecutiveFailures: 0,
+              firstFailureAt: null,
+              lastSuccessAt: null,
+              lastSuccessMethod: null,
+              successOutsideWindow: false,
+              runsExamined: 0,
+              schedule: target.schedule,
+              callArgs: [],
+              definitionArgs: [],
+              summary: nr.summary,
+            }),
+          };
         }
 
         // Walk versions newest-first. Reports are written on failure as well
@@ -1428,6 +1930,8 @@ export const model = {
         let error = head?.error ?? null;
         let failingMethod = head?.methodName ?? null;
         let rootCauseModel: string | null = null;
+        // Whichever run the error came from also says which arguments it took.
+        let argBody: Record<string, unknown> | null = headBody;
 
         // A workflow summary records which step failed, not why. The error
         // lives on the model that step invoked, so follow the reference --
@@ -1457,6 +1961,7 @@ export const model = {
                   if (typeof subBody.error === "string") {
                     error = subBody.error;
                     rootCauseModel = stepModel;
+                    argBody = subBody;
                   }
                 } catch {
                   // Fall through: the step name alone is still worth reporting.
@@ -1489,6 +1994,10 @@ export const model = {
         }
 
         const investigatedAt = isoTime(latest.createdAt);
+        const names = (v: unknown) =>
+          Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+        const callArgs = names(argBody?.methodArgs);
+        const definitionArgs = names(argBody?.globalArgs);
         const summary = buildSummary(
           target,
           timeline,
@@ -1496,6 +2005,7 @@ export const model = {
           error,
           failingMethod,
           rootCauseModel,
+          { call: callArgs, definition: definitionArgs },
         );
 
         context.logger.info(
@@ -1531,36 +2041,13 @@ export const model = {
           lastSuccessMethod: timeline.lastSuccess?.methodName ?? null,
           successOutsideWindow: timeline.successOutsideWindow,
           runsExamined: timeline.examined,
+          schedule: target.schedule,
+          callArgs,
+          definitionArgs,
           summary,
         };
 
-        // Two instances of the same finding, deliberately.
-        //
-        // The per-target instance keeps history: investigate the same thing
-        // twice and the versions are comparable to each other. Its name is
-        // sanitized, because swamp rejects `/` in a data name and a bundled
-        // workflow's name is required to be collective-scoped.
-        //
-        // `current` is the stable handle a workflow can reference without
-        // knowing the target's name at all -- `data.latest('triage',
-        // 'current')`. Deriving the instance from the target meant the
-        // reference had to reproduce the sanitization in CEL, which is both
-        // awkward and one more place for the two to drift apart.
-        //
-        // Concurrent investigations race on `current`; the per-target instance
-        // is the one to read when that matters.
-        const perTarget = await context.writeResource(
-          "investigation",
-          sanitizeInstanceName(target.name),
-          finding,
-        );
-        const current = await context.writeResource(
-          "investigation",
-          "current",
-          finding,
-        );
-
-        return { dataHandles: [perTarget, current] };
+        return { dataHandles: await recordFinding(context, finding) };
       },
     },
     recent: {
@@ -1572,8 +2059,12 @@ export const model = {
         "target name -- use it when an alert names nothing, then " +
         "`investigate` the one that matters. Read-only.",
       arguments: z.object({
-        withinHours: z.number().int().min(1).max(720).default(24).describe(
-          "How far back to look for failed runs.",
+        // No schema maximum: an over-wide request is capped in `execute` with
+        // a warning. A refusal fails the investigator's own run, which then
+        // shows up in the next `recent` as a failure nobody else caused.
+        withinHours: z.number().int().min(1).default(24).describe(
+          `How far back to look for failed runs. Values above ` +
+            `${MAX_WINDOW_HOURS} are capped at ${MAX_WINDOW_HOURS}.`,
         ),
         kind: z.enum(["auto", "model", "workflow"]).default("auto").describe(
           "Which targets to list. 'auto' lists models and workflows.",
@@ -1585,6 +2076,11 @@ export const model = {
           "How many earlier runs to read per recovered target when looking " +
             "for a failure inside the window.",
         ),
+        placementTag: z.string().optional().describe(
+          "key=value tag (e.g. runs-on=primary) naming the workflows this " +
+            "datastore runs; only those are checked for a schedule that has " +
+            "never fired. Omit to check every scheduled workflow.",
+        ),
       }),
       execute: async (
         args: {
@@ -1592,14 +2088,26 @@ export const model = {
           kind: string;
           limit: number;
           maxVersions: number;
+          placementTag?: string;
         },
         context: Context,
       ) => {
         const now = Date.now();
+        const requestedHours = args.withinHours;
+        const hours = Math.min(requestedHours, MAX_WINDOW_HOURS);
+        if (hours < requestedHours) {
+          context.logger.warning(
+            "withinHours {requested} is over the {max}h maximum; using {max}h",
+            { requested: requestedHours, max: MAX_WINDOW_HOURS },
+          );
+        }
+        const placement = parsePlacement(args.placementTag);
         context.logger.info(
           "Listing {kind} targets that failed in the last {hours}h",
-          { kind: args.kind, hours: args.withinHours },
+          { kind: args.kind, hours },
         );
+        const repoDir = context.globalArgs.repoDir ?? context.repoDir;
+        const definitions = await listDefinitions(repoDir, "auto");
         const { heads, skipped } = await readSummaryHeads(context);
         if (skipped > 0) {
           context.logger.warning(
@@ -1612,7 +2120,7 @@ export const model = {
           context,
           heads,
           now,
-          args.withinHours,
+          hours,
           args.kind,
           args.maxVersions,
         );
@@ -1626,10 +2134,11 @@ export const model = {
         const sel = selectRecentFailures(
           heads,
           now,
-          args.withinHours,
+          hours,
           args.kind,
           args.limit,
           recovered,
+          { selfType: MODEL_TYPE, definitions, placement },
         );
         const redactions = sel.failures.reduce((n, f) => n + f.redactions, 0);
         if (redactions > 0) {
@@ -1640,12 +2149,15 @@ export const model = {
           );
         }
         context.logger.info(
-          "{failing} failing in the last {hours}h ({stale} older), from " +
+          "{failing} failing in the last {hours}h ({stale} older, {own} the " +
+            "investigator's own, {never} scheduled never-run), from " +
             "{examined} summaries",
           {
             failing: sel.failures.length + sel.omitted,
-            hours: args.withinHours,
+            hours,
             stale: sel.staleFailing,
+            own: sel.failures.filter((f) => f.selfInflicted).length,
+            never: sel.scheduledNeverRun.length,
             examined: heads.length,
           },
         );
@@ -1654,15 +2166,20 @@ export const model = {
         // `data.latest('triage', 'recent')` the way it reads `current`.
         const handle = await context.writeResource("recent", "recent", {
           checkedAt: new Date(now).toISOString(),
-          withinHours: args.withinHours,
-          since: new Date(now - args.withinHours * 3_600_000).toISOString(),
+          withinHours: hours,
+          since: new Date(now - hours * 3_600_000).toISOString(),
           kind: args.kind,
           summariesExamined: heads.length,
           failures: sel.failures,
           omitted: sel.omitted,
           staleFailing: sel.staleFailing,
           historyTruncated: truncated,
-          summary: buildRecentSummary(sel, args.withinHours),
+          requestedHours,
+          scheduledNeverRun: sel.scheduledNeverRun,
+          placementTag: placement
+            ? `${placement.key}=${placement.value}`
+            : null,
+          summary: buildRecentSummary(sel, hours, requestedHours),
         });
         return { dataHandles: [handle] };
       },

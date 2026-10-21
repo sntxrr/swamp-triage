@@ -17,6 +17,12 @@ automates.
 | `investigate` | no      | Resolve a target by name, reconstruct when it broke, classify it |
 | `recent`      | no      | List everything that failed in a window, even if since recovered |
 
+Both methods separate the fleet's failures from the caller's: `recent` flags the
+investigator's own failed runs (`selfInflicted`) and a failure fixed by an
+immediate retry of the same method (`quickRetry`), and lists scheduled
+workflows that have never run (`scheduledNeverRun`); `investigate` suggests the
+closest names for one that matches nothing.
+
 Every method and workflow run already leaves a `@swamp/method-summary` or
 `@swamp/workflow-summary` report behind as versioned model data, written on
 failure as well as success — so a target's whole history is on disk before
@@ -36,7 +42,9 @@ stopping there reports `detect-drift failed` and omits the actual cause.
 | `tls`         | Failed at the transport layer, before the request        |
 | `rate_limit`  | Refused on volume, not correctness                       |
 | `not_found`   | Answered, but the addressed resource is gone             |
-| `config`      | Never left swamp — arguments failed validation           |
+| `caller_args` | The call's arguments failed the method schema            |
+| `config`      | Never left swamp — the definition or its inputs are wrong |
+| `never_run`   | No run recorded; failing when scheduled to run here      |
 | `unknown`     | No rule matched; reported verbatim rather than guessed   |
 | `unrecorded`  | Failed, but no error text was recorded or recoverable    |
 | `none`        | No error recorded; the target is not failing             |

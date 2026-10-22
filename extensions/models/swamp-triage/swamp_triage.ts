@@ -74,6 +74,21 @@ const UNREACHABLE_NEXT_STEP =
  */
 const RULES: Rule[] = [
   {
+    // Swamp's own wording when a `${{ }}` expression in a definition fails to
+    // evaluate. First, because the expression error quotes whatever it was
+    // evaluating -- "No such key", a 404 in a data value -- and those words
+    // would otherwise send the operator to the remote. The step never ran;
+    // the definition is wrong.
+    category: "config",
+    patterns: [/\binvalid expression\b/i, /ambiguous data\.latest\(\)/i],
+    meaning: "An expression in the definition failed to evaluate, so the " +
+      "step never ran. The remote is not involved: the definition reads " +
+      "data that is missing, ambiguous or shaped differently than it expects.",
+    nextStep: "Open the definition the step belongs to and fix the " +
+      "expression the error quotes -- for an ambiguous `data.latest()`, name " +
+      "the specific data item instead of the spec.",
+  },
+  {
     category: "auth",
     patterns: [
       /\b401\b/,
@@ -351,8 +366,9 @@ export function classifyError(
       category: "unrecorded",
       matched: false,
       meaning: "The run failed, but no error text was recorded or could be " +
-        "recovered -- typically an assert or expression step, or a step " +
-        "model whose latest summary belongs to a later, successful run.",
+        "recovered -- typically an assert step, or a workflow run that " +
+        "recorded no error for its failed step and whose step model has " +
+        "succeeded since.",
       nextStep: "Open the failing run's own summary with `swamp workflow " +
         "history logs` or `swamp report get`; the cause is there, not here.",
     };
@@ -491,8 +507,10 @@ export interface ResolvedTarget {
   definitionPath: string;
   /** A workflow's `trigger.schedule` cron, or null when it has none. */
   schedule: string | null;
-  /** A workflow's `tags`, e.g. a placement tag naming where it runs. */
+  /** The definition's `tags`, e.g. a placement tag naming where it runs. */
   tags: Record<string, string>;
+  /** The definition's `description`, folded to one line; "" when absent. */
+  description?: string;
 }
 
 /**
@@ -625,6 +643,226 @@ export function rankNames(
 }
 
 /**
+ * Read a definition's top-level `description`, folded to one line.
+ *
+ * The same deliberate non-parser as `readTopLevelScalars`, extended to the
+ * one block scalar worth reading: a `description: >-` or `|` block is every
+ * following line that is blank or indented, up to the next column-zero line.
+ * Folded and literal blocks are both joined with spaces -- the text is only
+ * ever searched, never shown.
+ *
+ * @param text Raw file contents.
+ * @returns The description, or "" when there is none.
+ */
+export function readDescription(text: string): string {
+  const lines = text.split("\n");
+  const at = lines.findIndex((l) => /^description:/.test(l));
+  if (at === -1) return "";
+  const inline = scalarValue(lines[at].slice("description:".length));
+  if (inline !== null) return inline;
+  const body: string[] = [];
+  for (const line of lines.slice(at + 1)) {
+    if (line.trim() !== "" && !/^\s/.test(line)) break;
+    if (line.trim() !== "") body.push(line.trim());
+  }
+  return body.join(" ");
+}
+
+/**
+ * Words too common in alert text, or in every definition, to say anything
+ * about which target an alert is about.
+ */
+const RESOLVE_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "has",
+  "in",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "the",
+  "to",
+  "was",
+  "with",
+  "alert",
+  "error",
+  "failed",
+  "failing",
+  "failure",
+  "model",
+  "ok",
+  "run",
+  "stale",
+  "swamp",
+  "warning",
+  "workflow",
+]);
+
+/**
+ * Split text into lowercase words on anything not a letter or digit.
+ *
+ * @param text Free text, a name, a type or a tag.
+ * @returns Words in order, duplicates kept.
+ */
+function words(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w !== "");
+}
+
+/**
+ * The distinct words of free alert text that can identify a target.
+ *
+ * @param text Alert text as an operator or agent passed it.
+ * @returns Lowercase words, in first-seen order, stopwords dropped.
+ */
+export function resolveTokens(text: string): string[] {
+  return [...new Set(words(text))].filter((w) => !RESOLVE_STOPWORDS.has(w));
+}
+
+/** One definition free alert text may be about. */
+export interface Resolution {
+  name: string;
+  /** "model" or "workflow". */
+  kind: string;
+  /** The model type, or literal "workflow". */
+  type: string;
+  /** The definition's `runs-on` tag: where it is scheduled; null if none. */
+  runsOn: string | null;
+  /** Higher is a better match; comparable only within one call. */
+  score: number;
+  /** The alert words this definition matched. */
+  matched: string[];
+  /** Repo-relative definition file. */
+  definitionPath: string;
+}
+
+/**
+ * Where a matched word was found, and what it is worth.
+ *
+ * A word in the name is the strongest evidence -- alerts quote names, and
+ * names are short. The type and tags are written about the definition too,
+ * but are shared by many. A description is long prose, so any one word in it
+ * says least.
+ */
+const RESOLVE_WEIGHT = { name: 3, meta: 2, description: 1 };
+
+/**
+ * Bonus when the alert quotes a definition's whole name, word for word.
+ *
+ * `backlog-groom-judgement` names a step of `backlog-groom`; every word of
+ * the name appears, in order, so the name is almost certainly what was meant.
+ */
+const RESOLVE_WHOLE_NAME = 3;
+
+/** Whether `needle` occurs as a contiguous run inside `hay`. */
+function containsRun(hay: string[], needle: string[]): boolean {
+  if (needle.length === 0 || needle.length > hay.length) return false;
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    if (needle.every((w, j) => hay[i + j] === w)) return true;
+  }
+  return false;
+}
+
+/**
+ * Rank definitions by how well free alert text matches them.
+ *
+ * An alert names its target in its own words -- `cold-storage disk-reports
+ * stale`, a step name, a type -- and seldom by the exact definition name
+ * `investigate` needs. Each alert word scores once, by the strongest place it
+ * is found: the name, then the type and tags, then the description. A
+ * definition whose whole name appears in the text gets a bonus. Token overlap
+ * only, no fuzzy matching, so every score can be explained from `matched`.
+ *
+ * Ties go to workflows: a scheduled workflow is what raises an alert, and
+ * investigating the workflow reaches its failing step's model anyway.
+ *
+ * @param text Alert text.
+ * @param definitions Every definition, as `listDefinitions` returns them.
+ * @param limit Most matches to return.
+ * @returns Best matches first; never a definition matching no word.
+ */
+export function resolveText(
+  text: string,
+  definitions: ResolvedTarget[],
+  limit = 5,
+): Resolution[] {
+  const query = resolveTokens(text);
+  const raw = words(text);
+  const out: Resolution[] = [];
+  for (const d of definitions) {
+    const name = new Set(words(d.name));
+    const meta = new Set([
+      ...(d.kind === "model" ? words(d.type) : []),
+      ...Object.entries(d.tags).flatMap(([k, v]) => [
+        ...words(k),
+        ...words(v),
+      ]),
+    ]);
+    const description = new Set(words(d.description ?? ""));
+    let score = 0;
+    const matched: string[] = [];
+    for (const w of query) {
+      const weight = name.has(w)
+        ? RESOLVE_WEIGHT.name
+        : meta.has(w)
+        ? RESOLVE_WEIGHT.meta
+        : description.has(w)
+        ? RESOLVE_WEIGHT.description
+        : 0;
+      if (weight === 0) continue;
+      score += weight;
+      matched.push(w);
+    }
+    if (score === 0) continue;
+    if (containsRun(raw, words(d.name))) score += RESOLVE_WHOLE_NAME;
+    out.push({
+      name: d.name,
+      kind: d.kind,
+      type: d.type,
+      runsOn: d.tags["runs-on"] ?? null,
+      score,
+      matched,
+      definitionPath: d.definitionPath,
+    });
+  }
+  const kindOrder = (k: string) => (k === "workflow" ? 0 : 1);
+  out.sort((a, b) =>
+    b.score - a.score || kindOrder(a.kind) - kindOrder(b.kind) ||
+    a.name.localeCompare(b.name)
+  );
+  return out.slice(0, limit);
+}
+
+/** Render a `resolve` result as short lines for a chat reply. */
+export function buildResolveSummary(
+  text: string,
+  matches: Resolution[],
+): string {
+  if (matches.length === 0) {
+    return `Nothing matched "${text}". Run \`recent\` to list what failed ` +
+      `instead.`;
+  }
+  return [
+    `Best matches for "${text}":`,
+    ...matches.map((m, i) =>
+      `${i + 1}. ${m.name} (${m.kind}` +
+      (m.runsOn ? `, runs-on ${m.runsOn}` : "") +
+      `) score ${m.score}: ${m.matched.join(", ")}`
+    ),
+    `Run \`investigate\` with target=${matches[0].name} ` +
+    `kind=${matches[0].kind}.`,
+  ].join("\n");
+}
+
+/**
  * Recursively yield every .yaml file under a directory.
  *
  * A missing directory yields nothing rather than throwing: a repo need not have
@@ -726,7 +964,8 @@ export async function listDefinitions(
         schedule: k === "workflow"
           ? readNestedScalars(text, "trigger").schedule ?? null
           : null,
-        tags: k === "workflow" ? readNestedScalars(text, "tags") : {},
+        tags: readNestedScalars(text, "tags"),
+        description: readDescription(text),
       });
     }
   }
@@ -898,13 +1137,47 @@ export interface RecentSelection {
   scheduledNeverRun: NeverRun[];
 }
 
+/** The first failed step a workflow summary records, and its own error. */
+export interface WorkflowStepFailure {
+  stepModel: string | null;
+  stepMethod: string | null;
+  /** The step's error as the workflow run recorded it; null when absent. */
+  errorMessage: string | null;
+}
+
+/**
+ * Read the first entry of a workflow summary's `failures`, or null when it
+ * has none.
+ *
+ * The workflow run records each failed step's own error as `errorMessage`.
+ * That is the error of *this* run. The step model's latest method summary is
+ * not: by the time anyone investigates, the model may have run again and
+ * succeeded -- and an expression that failed to evaluate never ran the model
+ * at all, so its summary never held the error in the first place.
+ */
+export function firstWorkflowFailure(
+  body: Record<string, unknown> | null | undefined,
+): WorkflowStepFailure | null {
+  if (!Array.isArray(body?.failures) || body.failures.length === 0) {
+    return null;
+  }
+  const first = body.failures[0] as Record<string, unknown> | undefined;
+  const str = (v: unknown) =>
+    typeof v === "string" && v.trim() !== "" ? v : null;
+  return {
+    stepModel: str(first?.modelName),
+    stepMethod: str(first?.methodName),
+    errorMessage: str(first?.errorMessage),
+  };
+}
+
 /**
  * Describe one failing summary: where it broke, and why.
  *
- * A workflow summary names the failing step but carries no error, so the
- * step's model is looked up among the method summaries the same query
- * already returned -- the same hop `investigate` makes, without a second
- * read.
+ * A workflow summary names the failing step and, usually, the error that
+ * step recorded in this run. Only when it carries no error is the step's
+ * model looked up among the method summaries the same query already
+ * returned -- the same hop `investigate` makes, without a second read.
  *
  * @param head The failing target's latest summary.
  * @param methodBodies Latest method-summary body per model name.
@@ -920,20 +1193,19 @@ export function describeFailure(
     : null;
   let rootCauseModel: string | null = null;
 
-  if (error === null && Array.isArray(body.failures)) {
-    const first = (body.failures as Record<string, unknown>[])[0];
-    const stepModel = typeof first?.modelName === "string"
-      ? first.modelName
-      : null;
-    const stepMethod = typeof first?.methodName === "string"
-      ? first.methodName
-      : null;
-    if (stepModel) {
+  const step = error === null ? firstWorkflowFailure(body) : null;
+  if (step) {
+    const { stepModel, stepMethod } = step;
+    if (step.errorMessage !== null) {
+      error = step.errorMessage;
+    } else if (stepModel) {
       const sub = methodBodies.get(stepModel);
       if (typeof sub?.error === "string") {
         error = sub.error;
         rootCauseModel = stepModel;
       }
+    }
+    if (stepModel) {
       failingMethod = stepMethod ? `${stepModel} → ${stepMethod}` : stepModel;
     }
   }
@@ -1393,6 +1665,28 @@ const RecentSchema = z.object({
   summary: z.string(),
 });
 
+const ResolveSchema = z.object({
+  resolvedAt: z.string(),
+  /** The alert text as given, with any identifiable secret value redacted. */
+  text: z.string(),
+  /** The words that were matched against definitions. */
+  tokens: z.array(z.string()),
+  kind: z.string(),
+  /** How many definitions were searched. */
+  definitionsExamined: z.number(),
+  matches: z.array(z.object({
+    name: z.string(),
+    kind: z.string(),
+    type: z.string(),
+    runsOn: z.string().nullable(),
+    score: z.number(),
+    matched: z.array(z.string()),
+    definitionPath: z.string(),
+  })),
+  /** Short ranked list, suitable for a chat reply. */
+  summary: z.string(),
+});
+
 const GlobalArgsSchema = z.object({
   repoDir: z.string().optional().describe(
     "Repository root to investigate. Defaults to the repo the model runs in.",
@@ -1556,7 +1850,7 @@ export function sanitizeInstanceName(name: string): string {
     // deno-lint-ignore no-control-regex
     .replace(/\x00/g, "%00")
     .replace(/\s/g, "%20");
-  // `current` and `recent` are the stable handles. A target with one of those
+  // `current`, `recent` and `resolve` are the stable handles. A target with one of those
   // names would overwrite the handle with a per-target finding, so its first
   // character is encoded too. Still injective: a literal `%` became `%25`.
   if (RESERVED_INSTANCES.has(encoded)) {
@@ -1567,7 +1861,7 @@ export function sanitizeInstanceName(name: string): string {
 }
 
 /** Instance names the model writes to on every run, whatever the target. */
-const RESERVED_INSTANCES = new Set(["current", "recent"]);
+const RESERVED_INSTANCES = new Set(["current", "recent", "resolve"]);
 
 /**
  * Write a finding under its per-target instance and under `current`.
@@ -1723,7 +2017,7 @@ export const MODEL_TYPE = "@sntxrr/swamp-triage/investigation";
 // behavior whose `type` it can read without evaluating code.
 export const model = {
   type: "@sntxrr/swamp-triage/investigation",
-  version: "2026.10.21.1",
+  version: "2026.10.22.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -1755,6 +2049,12 @@ export const model = {
         "fleet failures; global arguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.10.22.1",
+      description: "Add the `resolve` method; a workflow failure reports the " +
+        "error its run recorded; global arguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     investigation: {
@@ -1768,6 +2068,13 @@ export const model = {
       description: "Every model and workflow that failed within a window, " +
         "whether still failing or since recovered.",
       schema: RecentSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 20,
+    },
+    resolution: {
+      description: "The definitions free alert text most likely names, " +
+        "best first.",
+      schema: ResolveSchema,
       lifetime: "infinite" as const,
       garbageCollection: 20,
     },
@@ -1953,20 +2260,18 @@ export const model = {
         // Whichever run the error came from also says which arguments it took.
         let argBody: Record<string, unknown> | null = headBody;
 
-        // A workflow summary records which step failed, not why. The error
-        // lives on the model that step invoked, so follow the reference --
-        // otherwise investigating a workflow by name, which is all an alert
-        // gives you, stops one hop short of the actual cause.
-        if (error === null && Array.isArray(headBody?.failures)) {
-          const failures = headBody.failures as Record<string, unknown>[];
-          const first = failures[0];
-          const stepModel = typeof first?.modelName === "string"
-            ? first.modelName
-            : null;
-          const stepMethod = typeof first?.methodName === "string"
-            ? first.methodName
-            : null;
-          if (stepModel) {
+        // A workflow summary records which step failed and, usually, the
+        // error that step raised in this run. That recorded error comes
+        // first: it belongs to the failing run, where the step model's latest
+        // summary may belong to a later, successful one. Only when the run
+        // recorded none is the reference followed to the model the step
+        // invoked -- otherwise investigating a workflow by name, which is all
+        // an alert gives you, stops one hop short of the actual cause.
+        const step = error === null ? firstWorkflowFailure(headBody) : null;
+        if (step?.errorMessage) error = step.errorMessage;
+        if (step) {
+          const { stepModel, stepMethod } = step;
+          if (stepModel && error === null) {
             const sub = (await resolveTargets(repoDir, stepModel, "model"))[0];
             if (sub) {
               const subName = "report-swamp-method-summary-json";
@@ -1988,6 +2293,8 @@ export const model = {
                 }
               }
             }
+          }
+          if (stepModel) {
             failingMethod = stepMethod
               ? `${stepModel} → ${stepMethod}`
               : stepModel;
@@ -2200,6 +2507,52 @@ export const model = {
             ? `${placement.key}=${placement.value}`
             : null,
           summary: buildRecentSummary(sel, hours, requestedHours),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    resolve: {
+      description:
+        "Map free alert text to the model and workflow names it most likely " +
+        "means -- for an alert that does not name its target. Scores token " +
+        "overlap with each definition's name, type, tags and description and " +
+        "returns the top matches with kind, runs-on tag and score. Then " +
+        "`investigate` the first. Read-only.",
+      arguments: z.object({
+        text: z.string().min(1).describe(
+          "Free alert text, e.g. a notification title or a step name.",
+        ),
+        kind: z.enum(["auto", "model", "workflow"]).default("auto").describe(
+          "Which definitions to search. 'auto' searches both.",
+        ),
+        limit: z.number().int().min(1).max(20).default(5).describe(
+          "Most matches to return.",
+        ),
+      }),
+      execute: async (
+        args: { text: string; kind: string; limit: number },
+        context: Context,
+      ) => {
+        const repoDir = context.globalArgs.repoDir ?? context.repoDir;
+        const definitions = await listDefinitions(repoDir, args.kind);
+        // The text is echoed back into data, and an alert body can carry a
+        // secret value. A secret never helps match a name, so redact first.
+        const text = redactSecrets(args.text).text;
+        const matches = resolveText(text, definitions, args.limit);
+        context.logger.info(
+          "Resolved {count} match(es) for {text} from {examined} definitions",
+          { count: matches.length, text, examined: definitions.length },
+        );
+        // One stable instance, like `recent`. No match is an answer, not an
+        // error: a failed run here would read as a fleet failure in `recent`.
+        const handle = await context.writeResource("resolution", "resolve", {
+          resolvedAt: new Date().toISOString(),
+          text,
+          tokens: resolveTokens(text),
+          kind: args.kind,
+          definitionsExamined: definitions.length,
+          matches,
+          summary: buildResolveSummary(text, matches),
         });
         return { dataHandles: [handle] };
       },

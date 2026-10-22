@@ -1,8 +1,10 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import {
   buildRecentSummary,
+  buildResolveSummary,
   classifyError,
   describeFailure,
+  firstWorkflowFailure,
   isCallerError,
   isQuickRetry,
   listDefinitions,
@@ -13,6 +15,7 @@ import {
   parsePlacement,
   placedHere,
   rankNames,
+  readDescription,
   readNestedScalars,
   readRecoveredFailures,
   readSummaryHeads,
@@ -20,6 +23,8 @@ import {
   reconstructTimeline,
   redactSecrets,
   resolveTargets,
+  resolveText,
+  resolveTokens,
   type RunPoint,
   sanitizeInstanceName,
   selectRecentFailures,
@@ -1105,10 +1110,11 @@ Deno.test("recent: the recorded resource matches its schema, recovered entries i
 
 /* --------------------------- investigate --------------------------- */
 
-Deno.test("investigate: a failed workflow whose step model has since succeeded is unrecorded", async () => {
-  // The same hop as `recent`, made by `investigate`: it reads the step
-  // model's latest summary, which carries no error once that model has
-  // succeeded again. The finding must still say the workflow is failing.
+Deno.test("investigate: a failed workflow that recorded no step error, whose step model has since succeeded, is unrecorded", async () => {
+  // The fallback hop, made only when the workflow run recorded no error for
+  // its failed step: it reads the step model's latest summary, which carries
+  // no error once that model has succeeded again. The finding must still say
+  // the workflow is failing.
   const dir = await Deno.makeTempDir();
   try {
     await Deno.mkdir(`${dir}/models`, { recursive: true });
@@ -1680,4 +1686,286 @@ Deno.test("caller error: names, arguments and the old no-runs refusal only", () 
 const classified = (error: string) => ({
   error,
   category: classifyError(error, true).category,
+});
+
+/* ------------------- workflow-recorded step errors ------------------ */
+
+// Swamp's wording when a definition's expression fails to evaluate. The data
+// names are fictional.
+const AMBIGUOUS =
+  'Invalid expression: Ambiguous data.latest() match: specName "usage" ' +
+  "resolves to 2 data items (current, usage). Use the specific data name " +
+  "instead.";
+
+Deno.test("classify: an expression error is config, whatever it quotes", () => {
+  assertEquals(classifyError(AMBIGUOUS, true).category, "config");
+  assertEquals(classifyError(AMBIGUOUS, true).matched, true);
+  // Quotes "No such key", which alone would read as not_found.
+  assertEquals(
+    classifyError(
+      "Invalid expression: No such key: index out of bounds, index 0 >= " +
+        "size undefined",
+      true,
+    ).category,
+    "config",
+  );
+  // A vault expression that failed to resolve is not an expression error.
+  assertEquals(
+    classifyError(
+      "Failed to resolve vault expression vault.get('v', 'k'): " +
+        "authentication failed",
+      true,
+    ).category,
+    "auth",
+  );
+});
+
+Deno.test("workflow failure: reads the first failed step and its recorded error", () => {
+  assertEquals(
+    firstWorkflowFailure({
+      failures: [
+        { modelName: "reclaimer", methodName: "reclaim", errorMessage: "x" },
+        { modelName: "notifier", methodName: "notify", errorMessage: "y" },
+      ],
+    }),
+    { stepModel: "reclaimer", stepMethod: "reclaim", errorMessage: "x" },
+  );
+  assertEquals(
+    firstWorkflowFailure({ failures: [{ modelName: "m", errorMessage: " " }] }),
+    { stepModel: "m", stepMethod: null, errorMessage: null },
+  );
+  assertEquals(firstWorkflowFailure({ failures: [] }), null);
+  assertEquals(firstWorkflowFailure({ status: "failed" }), null);
+  assertEquals(firstWorkflowFailure(null), null);
+});
+
+Deno.test("recent: a workflow's recorded step error wins over the step model's later success", () => {
+  const f = describeFailure(
+    head("disk-sweep", "workflow", "2026-08-04T17:00:00Z", {
+      status: "failed",
+      failures: [{
+        modelName: "sweeper",
+        methodName: "reclaim",
+        errorMessage: AMBIGUOUS,
+      }],
+    }),
+    new Map([["sweeper", { status: "succeeded" }]]),
+  );
+  assertEquals(f.failingMethod, "sweeper → reclaim");
+  assertEquals(f.category, "config");
+  assertEquals(f.error, AMBIGUOUS);
+  // Read from the workflow's own record, not chased into the model.
+  assertEquals(f.rootCauseModel, null);
+});
+
+Deno.test("recent: a recorded step error is preferred to the step model's own error", () => {
+  // The step model's latest summary may be a different, later failure.
+  const f = describeFailure(
+    head("disk-sweep", "workflow", "2026-08-04T17:00:00Z", {
+      status: "failed",
+      failures: [{
+        modelName: "sweeper",
+        methodName: "reclaim",
+        errorMessage: AMBIGUOUS,
+      }],
+    }),
+    new Map([["sweeper", { status: "failed", error: "connect ECONNREFUSED" }]]),
+  );
+  assertEquals(f.category, "config");
+  assertEquals(f.error, AMBIGUOUS);
+});
+
+Deno.test("investigate: a failed workflow reports the expression error its run recorded", async () => {
+  const dir = await fixtureRepo({
+    "models/@acme/sweeper/m.yaml":
+      "type: '@acme/sweeper'\nid: m-1\nname: sweeper\n",
+    "workflows/w.yaml": "id: w-1\nname: disk-sweep\n",
+  });
+  try {
+    const { context, written } = methodContext(dir, {
+      "workflow/w-1": {
+        1: { status: "succeeded" },
+        2: {
+          status: "failed",
+          failures: [
+            {
+              modelName: "sweeper",
+              methodName: "reclaim",
+              errorMessage: AMBIGUOUS,
+            },
+            {
+              modelName: "notifier",
+              methodName: "notify",
+              errorMessage: "fetch failed",
+            },
+          ],
+        },
+      },
+      // The step model has succeeded since; its summary holds no error.
+      "@acme/sweeper/m-1": { 1: { status: "succeeded", methodName: "x" } },
+    });
+    await model.methods.investigate.execute(
+      { target: "disk-sweep", kind: "workflow", maxVersions: 60 },
+      context,
+    );
+    const finding = written.find((w) => w.instance === "current")!.data;
+    assertEquals(finding.failing, true);
+    assertEquals(finding.category, "config");
+    assertEquals(finding.error, AMBIGUOUS);
+    assertEquals(finding.failingMethod, "sweeper → reclaim");
+    assertEquals(finding.rootCauseModel, null);
+    assertEquals(
+      String(finding.summary).includes("Ambiguous data.latest()"),
+      true,
+    );
+    // Not the misleading "read from the model that step invoked" note.
+    assertEquals(String(finding.summary).includes("step invoked"), false);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+/* ------------------------------ resolve ------------------------------ */
+
+Deno.test("description: reads inline and block-scalar descriptions", () => {
+  assertEquals(readDescription("id: x\ndescription: one line\n"), "one line");
+  assertEquals(
+    readDescription(
+      "id: x\ndescription: >-\n  Copy the reports\n\n  to cold storage.\n" +
+        "name: y\n  indented: after\n",
+    ),
+    "Copy the reports to cold storage.",
+  );
+  assertEquals(readDescription("id: x\nname: y\n"), "");
+});
+
+Deno.test("resolve tokens: lowercase words, alert noise dropped", () => {
+  assertEquals(
+    resolveTokens("Cold-store disk-reports STALE: run failed"),
+    ["cold", "store", "disk", "reports"],
+  );
+});
+
+/** Definitions shaped as `listDefinitions` returns them. */
+const def = (
+  name: string,
+  kind: string,
+  extra: {
+    type?: string;
+    tags?: Record<string, string>;
+    description?: string;
+  } = {},
+) => ({
+  name,
+  kind,
+  type: extra.type ?? (kind === "workflow" ? "workflow" : "@acme/thing"),
+  id: `${kind}-${name}`,
+  definitionPath: `${kind}s/${name}.yaml`,
+  schedule: null,
+  tags: extra.tags ?? {},
+  description: extra.description ?? "",
+});
+
+const CATALOG = [
+  def("archive-disk-reports", "model", { type: "@acme/cloud/archive" }),
+  def("archive-disk-reports", "workflow", {
+    tags: { "runs-on": "scheduler-a", kind: "backup" },
+    description: "Copy the weekly disk reports to cold storage, then verify.",
+  }),
+  def("cold-storage-freshness", "workflow", {
+    description: "Alert when the newest archived object is too old.",
+  }),
+  def("archive-photos", "model", { type: "@acme/cloud/archive" }),
+  def("backlog-groom", "workflow", {
+    tags: { "runs-on": "scheduler-b" },
+    description: "Groom the backlog: judge, then reorder.",
+  }),
+  def("backlog-sync", "model", { type: "@acme/tracker" }),
+];
+
+Deno.test("resolve: alert words put the intended workflow first", () => {
+  const m = resolveText("cold disk-reports stale", CATALOG);
+  assertEquals(m[0].name, "archive-disk-reports");
+  assertEquals(m[0].kind, "workflow");
+  assertEquals(m[0].runsOn, "scheduler-a");
+  assertEquals(m[0].matched, ["cold", "disk", "reports"]);
+  assertEquals(m[1].name, "archive-disk-reports");
+  assertEquals(m[1].kind, "model");
+  assertEquals(m[1].runsOn, null);
+  assertEquals(m[0].score > m[1].score, true);
+});
+
+Deno.test("resolve: a step name that quotes a whole definition name finds it", () => {
+  const m = resolveText("backlog-groom-judgement", CATALOG);
+  assertEquals(m[0].name, "backlog-groom");
+  assertEquals(m[0].kind, "workflow");
+  // backlog-sync shares only "backlog", and no whole-name bonus.
+  assertEquals(m[0].score > m[1].score, true);
+  assertEquals(m[1].name, "backlog-sync");
+});
+
+Deno.test("resolve: a word only in the name is not taken from inside a longer word", () => {
+  // "sync" must not match an alert saying "async".
+  const m = resolveText("async queue", [def("sync", "model")]);
+  assertEquals(m, []);
+});
+
+Deno.test("resolve: a tie goes to the workflow, and limit caps the list", () => {
+  const defs = [def("nightly", "model"), def("nightly", "workflow")];
+  assertEquals(resolveText("nightly", defs).map((m) => m.kind), [
+    "workflow",
+    "model",
+  ]);
+  assertEquals(resolveText("archive", CATALOG, 2).length, 2);
+});
+
+Deno.test("resolve: matching nothing is an empty list, not a guess", () => {
+  assertEquals(resolveText("quasar telemetry", CATALOG), []);
+  assertEquals(resolveText("failed stale alert", CATALOG), []);
+  assertEquals(
+    buildResolveSummary("quasar", []).startsWith('Nothing matched "quasar"'),
+    true,
+  );
+});
+
+Deno.test("resolve: the method records a small ranked list and redacts the text", async () => {
+  const dir = await fixtureRepo({
+    "workflows/a.yaml": "id: w-1\nname: archive-disk-reports\ntags:\n" +
+      "  runs-on: scheduler-a\ndescription: >-\n  Copy the weekly disk " +
+      "reports to cold storage.\n",
+    "models/@acme/cloud/m.yaml": "type: '@acme/cloud/archive'\nid: m-1\n" +
+      "name: archive-disk-reports\n",
+    "workflows/b.yaml": "id: w-2\nname: unrelated-thing\n",
+  });
+  try {
+    const { context, written } = methodContext(dir, {});
+    await model.methods.resolve.execute(
+      { text: "cold disk-reports stale token=hunter2", kind: "auto", limit: 5 },
+      context,
+    );
+    assertEquals(written.length, 1);
+    assertEquals(written[0].spec, "resolution");
+    assertEquals(written[0].instance, "resolve");
+    const data = written[0].data;
+    const matches = data.matches as { name: string; kind: string }[];
+    assertEquals(matches.map((m) => `${m.name}/${m.kind}`), [
+      "archive-disk-reports/workflow",
+      "archive-disk-reports/model",
+    ]);
+    assertEquals(String(data.text).includes("hunter2"), false);
+    assertEquals(JSON.stringify(data).includes("hunter2"), false);
+    assertEquals(data.definitionsExamined, 3);
+    // Small enough to hand an agent with no file tool.
+    assertEquals(JSON.stringify(data).length < 2048, true);
+    assertEquals(
+      model.resources.resolution.schema.safeParse(data).success,
+      true,
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("instance name: a target named resolve cannot overwrite its handle", () => {
+  assertEquals(sanitizeInstanceName("resolve") === "resolve", false);
 });

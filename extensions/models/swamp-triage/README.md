@@ -159,6 +159,38 @@ was asked. A refused call would itself be recorded as a failure.
 
 Read-only, like `investigate`.
 
+### `resolve`
+
+```
+swamp model @sntxrr/swamp-triage/investigation method run resolve <name> \
+  text='cold-storage disk-reports stale'
+```
+
+| Argument | Default | Meaning                                  |
+| -------- | ------- | ---------------------------------------- |
+| `text`   | —       | Free alert text: a title, a step name    |
+| `kind`   | `auto`  | `auto`, `model`, or `workflow`           |
+| `limit`  | `5`     | Most matches to return (1–20)            |
+
+An alert names its target in its own words -- a share, a step, a type -- and
+seldom by the exact definition name `investigate` needs. `resolve` maps the
+text to the names it most likely means, best first, each with its `kind`,
+`type`, `runsOn` (the definition's `runs-on` tag, if any), `score` and the
+alert words it `matched`. Then `investigate` the first.
+
+Matching is token overlap and nothing fuzzier, so every score can be explained
+from `matched`. Each alert word scores once, by the strongest place it appears:
+the name (3), the model type or a tag (2), the description (1). A definition
+whose whole name appears word for word in the text, as `nightly-backup` does in
+`nightly-backup-verify`, gets 3 more. Common alert words (`failed`, `stale`,
+`error`, ...) are ignored. On a tie the workflow ranks first, because a
+scheduled workflow is what raises an alert. No match records an empty list
+rather than failing, and any secret value in the text is redacted before it is
+recorded. The result is one `resolution` instance named `resolve`, overwritten
+on each run and small enough to hand to an agent with no file tool.
+
+Read-only, like `investigate`.
+
 ## Categories
 
 The categories are chosen by **where they send you**, not by protocol trivia.
@@ -190,8 +222,14 @@ visibly unrecognised is the more useful answer.
 
 `unrecorded` is kept apart from both. `unknown` means there was text and no rule
 matched it, so a new rule is the fix; `unrecorded` means the run failed and left
-no text to match -- an assert step, or a step model that has succeeded since and
-so no longer carries the error -- so the fix is to read that run's own summary.
+no text to match, so the fix is to read that run's own summary. A failed
+workflow step's error is read from the workflow run's own record first; only
+when the run recorded none is the step's model consulted, and a model that has
+succeeded since no longer carries the error.
+
+An expression that fails to evaluate (`Invalid expression: ...`, including an
+ambiguous `data.latest()`) is `config` whatever text it quotes: the step never
+ran, so the definition is what is wrong.
 Reporting it as `none` would say "not failing" beside `status=failed`.
 
 ## The timeline
